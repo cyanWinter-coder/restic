@@ -674,6 +674,21 @@ Note that there is no need for a specific write order of data and tree blobs
 during a backup as the blobs only become referenced once the corresponding
 snapshot is uploaded.
 
+To enforce the invariant that an index only references existing packs, the
+repository verifies before flushing an index that every pack uploaded by the
+current repository instance still exists in the backend. The check uses
+metadata lookups instead of reading the pack contents, so it adds no
+significant IO overhead and stays independent of backups running concurrently
+on other repository instances: only packs uploaded by the instance itself are
+verified. If a pack is missing at this point, the index and the snapshot are
+not written and the backup fails with an error. The already uploaded packs
+remain in the repository as unreferenced data and can either be picked up by a
+retry of the backup or reindexed with ``restic repair index``, so no
+inconsistent snapshot can be produced. Byte-level integrity of pack contents
+is verified separately: blobs are checked while they are written, and full
+pack verification, including the content-addressed pack ID, is performed by
+``restic check`` and repaired with ``restic repair packs``.
+
 Reading data should follow the opposite order compared to writing. Only once a
 snapshot was written, it is guaranteed that all required data exists in the
 repository. This especially means that the list of snapshots to read should be
@@ -690,6 +705,30 @@ followed, which are derived from the above invariants.
 - A pack *must* be removed from the referencing index before it is deleted.
 - Rewriting a pack *must* write the new pack, update the index (add an updated
   index and delete the old one) and only then delete the old pack.
+
+Handling Missing Indexes and Damaged Packs
+-------------------------------------------
+The ordering rules above keep the repository recoverable even when files are
+lost or damaged after being written. Two failure modes have to be
+distinguished:
+
+- **Missing index files.** Packs are always written before the index that
+  references them, so a missing index never implies missing data. The packs
+  remain readable and ``restic repair index`` rebuilds the index from the pack
+  headers. Packs not covered by any index are reported as orphaned packs by
+  ``restic check`` and can be reindexed instead of being deleted.
+- **Damaged or missing pack files.** A pack referenced by an index that no
+  longer exists, or whose size or content does not match its index entry, is
+  reported by ``restic check``. ``restic repair packs`` salvages all still
+  readable blobs from the affected packs, uploads them into new packs and
+  rewrites the index; blobs that cannot be decrypted or whose hash does not
+  match are reported and require another backup of the affected data.
+
+When both failures occur at the same time, the index must always be repaired
+first, as all other repair steps rely on a correct index. The repair commands
+only append new files and rewrite index files, they never change the pack
+format, so the repository format and all command interfaces stay compatible
+with older restic versions.
 
 
 Backups and Deduplication

@@ -1,0 +1,15 @@
+Enhancement: Verify uploaded packs exist before writing the index
+
+Restic now checks that every pack file uploaded by the current backup still
+exists in the backend before flushing the index. If a pack vanished after the
+upload, for example due to a faulty or misconfigured backend, the backup is
+aborted with an error instead of writing an index that references
+non-existent packs. The index and the snapshot are then not modified, so the
+repository stays consistent and the backup can be retried.
+
+The check only uses metadata lookups for packs uploaded by the current
+repository instance, so it adds no significant overhead and does not affect
+backups running concurrently against the same repository. Packs left behind by
+an aborted backup can be reindexed with `restic repair index`; damaged packs
+continue to be detected by `restic check` and repaired with
+`restic repair packs`.

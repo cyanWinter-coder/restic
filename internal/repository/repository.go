@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"sort"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -46,6 +47,14 @@ type Repository struct {
 	treePM      *packerManager
 	dataPM      *packerManager
 	packerCount int
+
+	// uploadedPacks tracks pack files that this repository instance has
+	// uploaded to the backend. It is used to verify before flushing the
+	// index that all packs referenced by new index entries still exist.
+	// This prevents writing an index that references packs which were
+	// lost after the upload, for example due to a faulty backend.
+	uploadedPacks   map[restic.ID]struct{}
+	uploadedPacksMu sync.Mutex
 
 	allocEnc sync.Once
 	allocDec sync.Once
@@ -138,10 +147,11 @@ func New(be backend.Backend, opts Options) (*Repository, error) {
 	}
 
 	repo := &Repository{
-		be:          be,
-		opts:        opts,
-		idx:         index.NewMasterIndex(),
-		packerCount: defaultPackerCount,
+		be:            be,
+		opts:          opts,
+		idx:           index.NewMasterIndex(),
+		packerCount:   defaultPackerCount,
+		uploadedPacks: make(map[restic.ID]struct{}),
 	}
 
 	return repo, nil
@@ -638,7 +648,100 @@ func (r *Repository) flush(ctx context.Context) error {
 		return err
 	}
 
-	return r.idx.Flush(ctx, &internalRepository{r})
+	// Verify that all packs uploaded by this repository instance still exist
+	// before writing the index. An index must only reference packs that exist
+	// in the repository, so aborting here keeps the repository consistent and
+	// leaves the affected data as unreferenced orphan packs instead of
+	// unreachable index entries. The repository remains usable after resolving
+	// the underlying backend issue; the backup can be retried.
+	if err := r.verifyUploadedPacks(ctx); err != nil {
+		return err
+	}
+
+	if err := r.idx.Flush(ctx, &internalRepository{r}); err != nil {
+		return err
+	}
+
+	// all uploaded packs are now referenced by a saved index, reset the
+	// tracking state for subsequent uploads (e.g. repair operations)
+	r.uploadedPacksMu.Lock()
+	clear(r.uploadedPacks)
+	r.uploadedPacksMu.Unlock()
+	return nil
+}
+
+// ErrPackMissing is returned when one or more pack files that were uploaded
+// to the repository can no longer be found when they are about to be
+// referenced by an index. This usually indicates a faulty or misconfigured
+// backend.
+type ErrPackMissing struct {
+	PackIDs restic.IDs
+}
+
+func (e *ErrPackMissing) Error() string {
+	if len(e.PackIDs) == 1 {
+		return "pack " + e.PackIDs[0].String() + " uploaded by this repository is missing from the backend"
+	}
+	return fmt.Sprintf("%d packs uploaded by this repository are missing from the backend, first pack: %v",
+		len(e.PackIDs), e.PackIDs[0])
+}
+
+// verifyUploadedPacks checks that every pack uploaded by this repository
+// instance is still present in the backend. Only packs uploaded by this
+// instance are checked, so concurrently running backups that upload their own
+// packs are not affected.
+func (r *Repository) verifyUploadedPacks(ctx context.Context) error {
+	r.uploadedPacksMu.Lock()
+	packIDs := make(restic.IDs, 0, len(r.uploadedPacks))
+	for id := range r.uploadedPacks {
+		packIDs = append(packIDs, id)
+	}
+	r.uploadedPacksMu.Unlock()
+
+	if len(packIDs) == 0 {
+		return nil
+	}
+	sort.Sort(packIDs)
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(int(r.Connections()))
+	var missingMu sync.Mutex
+	var missing restic.IDs
+
+	for _, id := range packIDs {
+		id := id
+		g.Go(func() error {
+			h := backend.Handle{Type: backend.PackFile, Name: id.String()}
+			_, err := r.be.Stat(gctx, h)
+			if err == nil {
+				return nil
+			}
+			if r.be.IsNotExist(err) {
+				missingMu.Lock()
+				missing = append(missing, id)
+				missingMu.Unlock()
+				return nil
+			}
+			return fmt.Errorf("stat pack %v: %w", id, err)
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		sort.Sort(missing)
+		return &ErrPackMissing{PackIDs: missing}
+	}
+	return nil
+}
+
+// recordUploadedPack marks a pack file as uploaded by this repository
+// instance.
+func (r *Repository) recordUploadedPack(id restic.ID) {
+	r.uploadedPacksMu.Lock()
+	r.uploadedPacks[id] = struct{}{}
+	r.uploadedPacksMu.Unlock()
 }
 
 func (r *Repository) flushBlobSaver() {

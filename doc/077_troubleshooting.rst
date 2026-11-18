@@ -152,6 +152,20 @@ repair the index first!
 Please note that it is not recommended to repair the index unless the repository
 is actually damaged.
 
+If an error reports that a pack uploaded by the current backup is missing from
+the backend, then no inconsistent index or snapshot has been written: restic
+verifies the existence of all packs it uploaded before flushing the index and
+aborts the backup if one of them vanished. The affected data can be backed up
+again after resolving the underlying backend problem. Packs left behind by the
+failed backup are reported as orphaned packs and are reindexed by
+``restic repair index``.
+
+Concurrently running backups do not interfere with each other in this
+situation, as each backup only verifies the packs it uploaded itself. If a
+repository reports both missing indexes and damaged packs at the same time,
+repair the index first and then run ``restic repair packs`` for the packs
+listed by ``restic check``.
+
 4. Removing broken snapshots
 ****************************
 

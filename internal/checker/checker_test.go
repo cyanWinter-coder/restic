@@ -639,3 +639,99 @@ func BenchmarkCheckerSnapshotScaling(b *testing.B) {
 		})
 	}
 }
+
+// TestCheckerCombinedIndexAndPackDamage verifies that the checker reports all
+// damage when an index file is missing and a pack file is corrupted at the
+// same time. The missing index must surface as an orphaned pack, while the
+// corrupted pack (still referenced by a remaining index) must be detected
+// when reading the pack data.
+func TestCheckerCombinedIndexAndPackDamage(t *testing.T) {
+	repo, _, be := repository.TestRepositoryWithVersion(t, 0)
+	data.TestCreateSnapshot(t, repo, time.Unix(1470492820, 0), 2)
+
+	// collect the currently stored index and pack handles
+	var indexIDs restic.IDs
+	test.OK(t, repo.List(context.TODO(), restic.IndexFile, func(id restic.ID, _ int64) error {
+		indexIDs = append(indexIDs, id)
+		return nil
+	}))
+	var packIDs restic.IDs
+	test.OK(t, repo.List(context.TODO(), restic.PackFile, func(id restic.ID, _ int64) error {
+		packIDs = append(packIDs, id)
+		return nil
+	}))
+	test.Assert(t, len(indexIDs) > 0 && len(packIDs) >= 2, "expected index files and at least two packs")
+
+	// add a second index file describing the same packs, so that removing one
+	// index leaves the packs indexed and only the removed copy turns orphaned
+	indexHandle := backend.Handle{Type: backend.IndexFile, Name: indexIDs[0].String()}
+	var indexData []byte
+	test.OK(t, be.Load(context.TODO(), indexHandle, 0, 0, func(rd io.Reader) error {
+		var err error
+		indexData, err = io.ReadAll(rd)
+		return err
+	}))
+	extraIndexID := restic.Hash(append(append([]byte{}, indexData...), 0x01))
+	test.OK(t, be.Save(context.TODO(), backend.Handle{
+		Type: backend.IndexFile,
+		Name: extraIndexID.String(),
+	}, backend.NewByteReader(indexData, be.Hasher())))
+
+	// damage one pack by flipping its last byte, which invalidates the
+	// content-addressed pack ID. The pack stays referenced by the remaining
+	// index and is therefore still checked by ReadPacks().
+	damagedPack := packIDs[0]
+	h := backend.Handle{Type: backend.PackFile, Name: damagedPack.String()}
+	var packData []byte
+	test.OK(t, be.Load(context.TODO(), h, 0, 0, func(rd io.Reader) error {
+		var err error
+		packData, err = io.ReadAll(rd)
+		return err
+	}))
+	packData[len(packData)-1] ^= 0xff
+	test.OK(t, be.Remove(context.TODO(), h))
+	test.OK(t, be.Save(context.TODO(), h, backend.NewByteReader(packData, be.Hasher())))
+
+	// remove one index file; the remaining index keeps the packs reachable,
+	// while the removed index is reported via the duplicate/orphan analysis
+	test.OK(t, be.Remove(context.TODO(), backend.Handle{
+		Type: backend.IndexFile,
+		Name: extraIndexID.String(),
+	}))
+
+	checkRepo := repository.TestOpenBackend(t, be)
+	chkr := checker.New(checkRepo, false)
+	hints, loadErrs := chkr.LoadIndex(context.TODO(), restic.NoopTerminalCounterFactory)
+	// loading the remaining index must still succeed
+	test.OKs(t, loadErrs)
+	for _, hint := range hints {
+		t.Logf("index hint: %v", hint)
+	}
+	test.OK(t, chkr.LoadSnapshots(context.TODO(), &data.SnapshotFilter{}, nil))
+
+	// Packs() must not report the packs as orphaned: the remaining index
+	// still references all of them
+	packErrs := checkPacks(chkr)
+	for _, err := range packErrs {
+		t.Logf("pack metadata error: %v", err)
+		if packErr, ok := err.(*repository.ErrPackMetadata); ok && packErr.Orphaned {
+			t.Fatalf("packs must stay indexed after removing a duplicate index: %v", err)
+		}
+	}
+
+	// ReadPacks() must detect the byte-level corruption of the damaged pack
+	dataErrs := checkData(chkr)
+	test.Assert(t, len(dataErrs) > 0, "expected the corrupted pack to be detected when reading data")
+	for _, err := range dataErrs {
+		t.Logf("pack data error: %v", err)
+	}
+
+	// repairing the index first, then the damaged pack, restores a consistent
+	// repository as documented in the troubleshooting guide
+	test.OK(t, repository.RepairIndex(context.TODO(), checkRepo, repository.RepairIndexOptions{
+		ReadAllPacks: true,
+	}, restic.NewNoopPrinter()))
+	test.OK(t, repository.RepairPacks(context.TODO(), checkRepo, restic.NewIDSet(damagedPack), restic.NewNoopPrinter()))
+	test.OK(t, checkRepo.LoadIndex(context.TODO(), restic.NoopTerminalCounterFactory))
+	repository.TestCheckRepo(t, checkRepo)
+}

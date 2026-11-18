@@ -266,6 +266,9 @@ func (r *Repository) savePacker(ctx context.Context, t restic.BlobType, p *packe
 	}
 
 	debug.Log("saved as %v", h)
+	// remember the uploaded pack so that flush can verify that it still
+	// exists before the pack is referenced by an index
+	r.recordUploadedPack(id)
 
 	err = p.tmpfile.Close()
 	if err != nil {
