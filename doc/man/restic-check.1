@@ -19,6 +19,13 @@ snapshots, trees and pack files. To also verify the integrity of the actual
 backed-up data, use the --read-data or --read-data-subset flags.
 
 .PP
+Structural checks and pack data checks can be run separately with
+--structure-only and --data-only. Use --pack-range to restrict pack-level
+conclusions to an inclusive pack ID range. Long data checks can be resumed with
+--checkpoint, and --damaged-packs-file writes a stable readable list of bad
+packs. check never deletes repository data itself.
+
+.PP
 By default, check creates a new temporary cache directory to verify data.
 To reuse the existing cache, use the --with-cache flag.
 
@@ -32,12 +39,32 @@ Exit status is 12 if the password is incorrect.
 
 
 .SH OPTIONS
+\fB--checkpoint\fP=""
+	resumable JSONL \fBfile\fR recording completed pack checks; it is created if it does not exist
+
+.PP
+\fB--concurrency\fP=0
+	maximum number of packs to verify concurrently (default: backend connection limit)
+
+.PP
+\fB--damaged-packs-file\fP=""
+	write a readable list of damaged or unreadable packs to \fBfile\fR
+
+.PP
+\fB--data-only\fP[=false]
+	run only pack data verification (implies --read-data unless a subset/range is given)
+
+.PP
 \fB-h\fP, \fB--help\fP[=false]
 	help for check
 
 .PP
 \fB-H\fP, \fB--host\fP=[]
 	only consider snapshots for this \fBhost\fR (can be specified multiple times, use empty string to unset default value) (default: $RESTIC_HOST)
+
+.PP
+\fB--pack-range\fP=""
+	only check packs in inclusive hex \fBrange\fR, e.g. 00aa..ff00 or 00aa-ff00; abbreviated IDs are allowed
 
 .PP
 \fB--path\fP=[]
@@ -50,6 +77,14 @@ Exit status is 12 if the password is incorrect.
 .PP
 \fB--read-data-subset\fP=""
 	read a \fBsubset\fR of data packs, specified as 'n/t' for specific part, or either 'x%' or 'x.y%' or a size in bytes with suffixes k/K, m/M, g/G, t/T for a random subset
+
+.PP
+\fB--retry-failed\fP[=false]
+	recheck packs with damaged or failed checkpoint results when resuming
+
+.PP
+\fB--structure-only\fP[=false]
+	run only index, pack metadata, snapshot and tree checks
 
 .PP
 \fB--tag\fP=[]

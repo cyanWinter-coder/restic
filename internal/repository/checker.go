@@ -244,9 +244,35 @@ func (c *Checker) Packs(ctx context.Context, errChan chan<- error) {
 	}
 }
 
+// ReadPacksOptions configures ReadPacksWithOptions.
+type ReadPacksOptions struct {
+	// Filter selects the packs to verify. It receives all packs known to the
+	// index and returns the subset to read.
+	Filter func(packs map[restic.ID]int64) map[restic.ID]int64
+	// Printer reports progress and warmup information.
+	Printer restic.Printer
+	// Concurrency is the maximum number of packs verified concurrently. A
+	// value of zero uses the repository backend's connection limit.
+	Concurrency uint
+	// OnPackComplete is called after a pack has been verified. It may be
+	// called concurrently and must therefore be safe for concurrent use.
+	OnPackComplete func(id restic.ID, size int64, err error)
+}
+
 // ReadPacks loads data from specified packs and checks the integrity.
 func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID]int64) map[restic.ID]int64, printer restic.Printer, errChan chan<- error) {
+	c.ReadPacksWithOptions(ctx, ReadPacksOptions{Filter: filter, Printer: printer}, errChan)
+}
+
+// ReadPacksWithOptions loads and verifies selected packs.
+func (c *Checker) ReadPacksWithOptions(ctx context.Context, opts ReadPacksOptions, errChan chan<- error) {
 	defer close(errChan)
+	if opts.Filter == nil {
+		opts.Filter = func(packs map[restic.ID]int64) map[restic.ID]int64 { return packs }
+	}
+	if opts.Printer == nil {
+		opts.Printer = restic.NewNoopPrinter()
+	}
 
 	// compute pack size using index entries
 	packs, err := pack.Size(ctx, c.repo, false)
@@ -254,9 +280,9 @@ func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID
 		errChan <- err
 		return
 	}
-	packs = filter(packs)
+	packs = opts.Filter(packs)
 
-	p := printer.NewCounter("packs")
+	p := opts.Printer.NewCounter("packs")
 	p.SetMax(uint64(len(packs)))
 	defer p.Done()
 
@@ -272,7 +298,7 @@ func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID
 			return
 		}
 		if job.HandleCount() != 0 {
-			printer.P("warming up %d packs from cold storage, this may take a while...", job.HandleCount())
+			opts.Printer.P("warming up %d packs from cold storage, this may take a while...", job.HandleCount())
 			if err := job.Wait(ctx); err != nil {
 				errChan <- err
 				return
@@ -288,8 +314,15 @@ func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID
 	}
 	ch := make(chan checkTask)
 
-	// as packs are streamed the concurrency is limited by IO
-	workerCount := int(c.repo.Connections())
+	// The worker count bounds pack processing. Backend connection limits and
+	// optional bandwidth limiting still bound the actual I/O parallelism.
+	workerCount := int(opts.Concurrency)
+	if workerCount == 0 {
+		workerCount = int(c.repo.Connections())
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
 	// run workers
 	for range workerCount {
 		g.Go(func() error {
@@ -314,6 +347,12 @@ func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID
 
 				err := checkPack(ctx, c.repo, ps.id, ps.blobs, ps.size, bufRd, dec)
 				p.Add(1)
+				if ctx.Err() != nil {
+					return nil
+				}
+				if opts.OnPackComplete != nil {
+					opts.OnPackComplete(ps.id, ps.size, err)
+				}
 				if err == nil {
 					continue
 				}

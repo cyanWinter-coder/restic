@@ -296,18 +296,34 @@ func (c *Checker) UnusedBlobs(ctx context.Context) (blobs restic.BlobHandles, er
 	return blobs, err
 }
 
+// ReadPacksOptions configures Checker.ReadPacksWithOptions.
+type ReadPacksOptions = repository.ReadPacksOptions
+
 // ReadPacks wraps repository.ReadPacks:
 // in case snapshot filtering is not active it calls repository.ReadPacks()
 // with an unmodified parameter list
 // Otherwise it calculates the packfiles needed, gets their sizes from the full
 // packfile set and submits them to repository.ReadPacks()
 func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID]int64) map[restic.ID]int64, printer restic.Printer, errChan chan<- error) {
+	c.ReadPacksWithOptions(ctx, ReadPacksOptions{Filter: filter, Printer: printer}, errChan)
+}
+
+// ReadPacksWithOptions is ReadPacks with concurrency and completion hooks.
+func (c *Checker) ReadPacksWithOptions(ctx context.Context, opts ReadPacksOptions, errChan chan<- error) {
+	if opts.Filter == nil {
+		opts.Filter = func(packs map[restic.ID]int64) map[restic.ID]int64 { return packs }
+	}
+	if opts.Printer == nil {
+		opts.Printer = restic.NewNoopPrinter()
+	}
+
 	// no snapshot filtering, pass through
 	if !c.IsFiltered() {
-		c.Checker.ReadPacks(ctx, filter, printer, errChan)
+		c.Checker.ReadPacksWithOptions(ctx, opts, errChan)
 		return
 	}
 
+	userFilter := opts.Filter
 	packfileFilter := func(allPacks map[restic.ID]int64) map[restic.ID]int64 {
 		filteredPacks := make(map[restic.ID]int64)
 		c.blobRefs.Lock()
@@ -320,8 +336,9 @@ func (c *Checker) ReadPacks(ctx context.Context, filter func(packs map[restic.ID
 			}
 		}
 
-		return filter(filteredPacks)
+		return userFilter(filteredPacks)
 	}
 
-	c.Checker.ReadPacks(ctx, packfileFilter, printer, errChan)
+	opts.Filter = packfileFilter
+	c.Checker.ReadPacksWithOptions(ctx, opts, errChan)
 }

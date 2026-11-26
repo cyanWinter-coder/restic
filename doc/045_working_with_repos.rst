@@ -551,6 +551,62 @@ a file size value the following command may be used:
     $ restic -r /srv/restic-repo check --read-data-subset=50M
     $ restic -r /srv/restic-repo check --read-data-subset=10G
 
+Checking a pack ID range and resuming long checks
+-------------------------------------------------
+
+For very large repositories, ``--read-data-subset=n/t`` is usually the easiest
+way to spread verification over multiple runs. If an external schedule tracks
+pack IDs instead, ``--pack-range`` accepts an inclusive lexicographical
+hexadecimal interval:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo check --data-only --pack-range 00..7f
+    $ restic -r /srv/restic-repo check --data-only --pack-range 80..ff
+
+Abbreviated IDs are expanded: a start prefix is padded with zeroes and an end
+prefix with ``f``. A single full ID can be checked with
+``--pack-range=ID..ID``. Packs outside the selected range are omitted from the
+data statistics and damaged-pack conclusion. The command output explicitly
+states that the result is partial.
+
+Use ``--checkpoint=FILE`` to record each checked pack in an append-only JSONL
+file. If the command is interrupted, running the same command with the same
+checkpoint file skips packs that already have a terminal result and only checks
+missing packs again. Damaged or failed results are reused so that repeated runs
+remain consistent; pass ``--retry-failed`` to explicitly verify those packs
+again after a possible repair:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo check --read-data \
+        --checkpoint /var/lib/restic/check.jsonl \
+        --damaged-packs-file /var/lib/restic/damaged-packs.txt
+    $ restic -r /srv/restic-repo check --read-data \
+        --checkpoint /var/lib/restic/check.jsonl --retry-failed
+
+The checkpoint records the repository ID and the exact selection. Reusing it
+for another repository or another range is rejected instead of silently
+producing a misleading conclusion.
+
+Structural and data checks can also be scheduled independently:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo check --structure-only
+    $ restic -r /srv/restic-repo check --data-only --checkpoint ...
+
+Both text output and the JSON summary contain separate ``structure`` and
+``data`` statistics. Pack lists in the JSON summary and damage report are
+sorted, so an unchanged repository produces the same lists on repeated runs.
+``--concurrency`` limits pack verification workers. The global
+``--limit-download`` option limits download bandwidth.
+
+If damaged or unreadable packs are found, they are printed as a readable list
+and optionally written to ``--damaged-packs-file``. Restic does not delete or
+repair those packs automatically; the output only suggests explicit
+``restic repair ...`` commands to run after inspection.
+
 Finding things in the repository
 ================================
 

@@ -400,6 +400,10 @@ Summary
 +--------------------------+------------------------------------------------------------------------------------------------+----------+
 | ``broken_packs``         | Run "restic repair packs ID..." and "restic repair snapshots --forget" to remove damaged files | []string |
 +--------------------------+------------------------------------------------------------------------------------------------+----------+
+| ``structure``            | Statistics for the structural check phase; ``status`` is one of ``not_run``, ``ok`` or ``errors`` | object |
++--------------------------+------------------------------------------------------------------------------------------------+----------+
+| ``data``                 | Statistics for the pack data phase, including selected, checked, resumed and damaged pack counts | object |
++--------------------------+------------------------------------------------------------------------------------------------+----------+
 | ``suggest_repair_index`` | Run "restic repair index"                                                                      | bool     |
 +--------------------------+------------------------------------------------------------------------------------------------+----------+
 | ``suggest_prune``        | Run "restic prune"                                                                             | bool     |

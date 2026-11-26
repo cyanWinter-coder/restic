@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -36,6 +38,12 @@ finds.
 By default, check verifies the structural consistency and integrity of
 snapshots, trees and pack files. To also verify the integrity of the actual
 backed-up data, use the --read-data or --read-data-subset flags.
+
+Structural checks and pack data checks can be run separately with
+--structure-only and --data-only. Use --pack-range to restrict pack-level
+conclusions to an inclusive pack ID range. Long data checks can be resumed with
+--checkpoint, and --damaged-packs-file writes a stable readable list of bad
+packs. check never deletes repository data itself.
 
 By default, check creates a new temporary cache directory to verify data.
 To reuse the existing cache, use the --with-cache flag.
@@ -77,6 +85,25 @@ type CheckOptions struct {
 	ReadDataSubset string
 	CheckUnused    bool
 	WithCache      bool
+
+	// PackRange restricts pack-level conclusions to an inclusive pack ID range.
+	PackRange string
+	// CheckpointFile stores completed pack results and allows an interrupted
+	// data verification to resume when the same path is supplied again.
+	CheckpointFile string
+	// DamageReportFile receives a stable, human-readable list of bad packs.
+	DamageReportFile string
+	// StructureOnly runs only structural checks.
+	StructureOnly bool
+	// DataOnly runs only pack data verification.
+	DataOnly bool
+	// Concurrency caps concurrent pack verification workers. Zero uses the
+	// backend connection limit.
+	Concurrency uint
+	// RetryFailed checks packs whose latest checkpoint result was not verified
+	// instead of reusing that terminal result on resume.
+	RetryFailed bool
+
 	data.SnapshotFilter
 }
 
@@ -91,10 +118,43 @@ func (opts *CheckOptions) AddFlags(f *pflag.FlagSet) {
 		panic(err)
 	}
 	f.BoolVar(&opts.WithCache, "with-cache", false, "use existing cache, only read uncached data from repository")
+	f.StringVar(&opts.PackRange, "pack-range", "", "only check packs in inclusive hex `range`, e.g. 00aa..ff00 or 00aa-ff00; abbreviated IDs are allowed")
+	f.StringVar(&opts.PackRange, "range", "", "alias for --pack-range")
+	f.StringVar(&opts.CheckpointFile, "checkpoint", "", "resumable JSONL `file` recording completed pack checks; it is created if it does not exist")
+	f.StringVar(&opts.CheckpointFile, "progress-file", "", "alias for --checkpoint")
+	f.StringVar(&opts.CheckpointFile, "state-file", "", "alias for --checkpoint")
+	f.StringVar(&opts.DamageReportFile, "damaged-packs-file", "", "write a readable list of damaged or unreadable packs to `file`")
+	f.StringVar(&opts.DamageReportFile, "failed-packs-file", "", "alias for --damaged-packs-file")
+	f.StringVar(&opts.DamageReportFile, "damage-report", "", "alias for --damaged-packs-file")
+	f.BoolVar(&opts.StructureOnly, "structure-only", false, "run only index, pack metadata, snapshot and tree checks")
+	f.BoolVar(&opts.DataOnly, "data-only", false, "run only pack data verification (implies --read-data unless a subset/range is given)")
+	f.UintVar(&opts.Concurrency, "concurrency", 0, "maximum number of packs to verify concurrently (default: backend connection limit)")
+	f.UintVar(&opts.Concurrency, "workers", 0, "alias for --concurrency")
+	f.UintVar(&opts.Concurrency, "pack-workers", 0, "alias for --concurrency")
+	f.BoolVar(&opts.RetryFailed, "retry-failed", false, "recheck packs with damaged or failed checkpoint results when resuming")
+	for _, name := range []string{"range", "progress-file", "state-file", "failed-packs-file", "damage-report", "workers", "pack-workers"} {
+		if flag := f.Lookup(name); flag != nil {
+			flag.Hidden = true
+		}
+	}
 	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 }
 
 func checkFlags(opts CheckOptions) error {
+	if opts.StructureOnly && opts.DataOnly {
+		return errors.Fatal("check flags --structure-only and --data-only cannot be used together")
+	}
+	if opts.StructureOnly && opts.CheckpointFile != "" {
+		return errors.Fatal("check flag --checkpoint records data checks and cannot be used with --structure-only")
+	}
+	if opts.CheckpointFile != "" && opts.CheckpointFile == opts.DamageReportFile {
+		return errors.Fatal("check flags --checkpoint and --damaged-packs-file must use different files")
+	}
+	if opts.PackRange != "" {
+		if _, err := checker.ParsePackRange(opts.PackRange); err != nil {
+			return errors.Fatalf("check flag --pack-range is invalid: %v", err)
+		}
+	}
 	if opts.ReadData && opts.ReadDataSubset != "" {
 		return errors.Fatal("check flags --read-data and --read-data-subset cannot be used together")
 	}
@@ -226,8 +286,41 @@ func prepareCheckCache(opts CheckOptions, gopts *global.Options, printer restic.
 	return cleanup
 }
 
-func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args []string, term ui.Terminal) (checkSummary, error) {
-	summary := checkSummary{MessageType: "summary"}
+func writePackReportFile(path, repoID, scope string, results []checker.PackResult) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	reportErr := checker.WritePackReport(f, repoID, scope, results)
+	closeErr := f.Close()
+	if reportErr != nil {
+		return reportErr
+	}
+	return closeErr
+}
+
+func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args []string, term ui.Terminal) (summary checkSummary, err error) {
+	summary = checkSummary{
+		MessageType: "summary",
+		Structure:   &structureCheckSummary{Status: "not_run"},
+		Data:        &dataCheckSummary{Status: "not_run"},
+	}
+	if err := checkFlags(opts); err != nil {
+		return summary, err
+	}
+
+	idRange := packRange{}
+	if opts.PackRange != "" {
+		idRange, err = parsePackRange(opts.PackRange)
+		if err != nil {
+			return summary, errors.Fatalf("check flag --pack-range is invalid: %v", err)
+		}
+	}
+
+	runStructure := !opts.DataOnly
+	wantsData := opts.DataOnly || opts.ReadData || opts.ReadDataSubset != "" ||
+		opts.PackRange != "" || opts.CheckpointFile != ""
+	runData := wantsData && !opts.StructureOnly
 
 	var printer restic.Printer
 	if !gopts.JSON {
@@ -235,6 +328,35 @@ func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args
 	} else {
 		printer = newJSONErrorPrinter(term)
 	}
+
+	findings := newPackResultTracker()
+	var checkpoint *checker.Checkpoint
+	repoID := "unknown"
+	dataScope := "unconfigured"
+	defer func() {
+		if opts.DamageReportFile != "" {
+			results := findings.Results()
+			if checkpoint != nil {
+				results = checkpoint.Results()
+			}
+			if reportErr := writePackReportFile(opts.DamageReportFile, repoID, dataScope, results); reportErr != nil {
+				printer.E("unable to write damaged packs report: %v\n", reportErr)
+				if err == nil {
+					err = errors.Fatalf("write damaged packs report: %v", reportErr)
+				}
+			} else {
+				printer.P("damaged packs report written to %s\n", opts.DamageReportFile)
+			}
+		}
+		if checkpoint != nil {
+			if closeErr := checkpoint.Close(); closeErr != nil {
+				printer.E("unable to close checkpoint: %v\n", closeErr)
+				if err == nil {
+					err = errors.Fatalf("close check checkpoint: %v", closeErr)
+				}
+			}
+		}
+	}()
 
 	cleanup := prepareCheckCache(opts, &gopts, printer)
 	defer cleanup()
@@ -247,12 +369,39 @@ func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args
 		return summary, err
 	}
 	defer unlock()
+	repoID = repo.Config().ID
 
 	chkr := checker.New(repo, opts.CheckUnused)
 	err = chkr.LoadSnapshots(ctx, &opts.SnapshotFilter, args)
 	if err != nil {
 		return summary, err
 	}
+
+	scopeParts := []string{"check-v1"}
+	if chkr.IsFiltered() {
+		scopeParts = append(scopeParts, "snapshot-filtered")
+		scopeParts = append(scopeParts, args...)
+		scopeParts = append(scopeParts, fmt.Sprintf("filter=%#v", opts.SnapshotFilter))
+	}
+	if opts.PackRange != "" {
+		scopeParts = append(scopeParts, "range="+idRange.String())
+	}
+	if opts.ReadDataSubset != "" {
+		scopeParts = append(scopeParts, "subset="+opts.ReadDataSubset)
+	}
+	dataScope = strings.Join(scopeParts, ";")
+
+	if opts.CheckpointFile != "" {
+		checkpoint, err = checker.OpenCheckpoint(opts.CheckpointFile, repoID, dataScope)
+		if err != nil {
+			return summary, errors.Fatalf("unable to open check checkpoint: %v", err)
+		}
+		verified, damaged, failed := checkpoint.Counts()
+		summary.Data.CheckpointFile = opts.CheckpointFile
+		printer.P("resuming check from %s: %d verified, %d damaged, %d failed pack results recorded\n",
+			opts.CheckpointFile, verified, damaged, failed)
+	}
+	summary.Data.ReportFile = opts.DamageReportFile
 
 	printer.P("load indexes\n")
 	hints, errs := chkr.LoadIndex(ctx, printer)
@@ -266,19 +415,32 @@ func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args
 	for _, hint := range hints {
 		switch hint := hint.(type) {
 		case *repository.ErrIncompletePackEntry:
+			if opts.PackRange != "" && !idRange.Contains(hint.PackID) {
+				printer.V("skipping out-of-range index hint: %v\n", hint)
+				continue
+			}
 			printer.E("%s", hint.Error())
 			salvagePacks.Insert(hint.PackID)
 			errorsFound = true
 			summary.NumErrors++
+			summary.Structure.Errors++
 		case *repository.ErrDuplicatePacks:
+			if opts.PackRange != "" && !idRange.Contains(hint.PackID) {
+				continue
+			}
 			printer.S("%s", hint.Error())
 			summary.HintRepairIndex = true
 		case *repository.ErrMixedPack:
+			if opts.PackRange != "" && !idRange.Contains(hint.PackID) {
+				continue
+			}
 			printer.S("%s", hint.Error())
 			summary.HintPrune = true
 		default:
 			printer.E("error: %v\n", hint)
 			errorsFound = true
+			summary.NumErrors++
+			summary.Structure.Errors++
 		}
 	}
 
@@ -295,87 +457,131 @@ func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args
 		}
 
 		summary.NumErrors += len(errs)
+		summary.Structure.Errors += len(errs)
+		summary.Structure.Status = "errors"
 		summary.HintRepairIndex = true
 		printer.E("\nThe repository index is damaged and must be repaired. You must run `restic repair index' to correct this.\n\n")
 		return summary, errors.Fatal("repository contains errors")
 	}
 
 	orphanedPacks := 0
-	errChan := make(chan error)
+	if runStructure {
+		errChan := make(chan error)
 
-	printer.P("check all packs\n")
-	go chkr.Packs(ctx, errChan)
+		if opts.PackRange == "" {
+			printer.P("check all packs\n")
+		} else {
+			printer.P("check packs in range %s\n", idRange.String())
+		}
+		go chkr.Packs(ctx, errChan)
 
-	for err := range errChan {
-		var packErr *repository.ErrPackMetadata
-		if errors.As(err, &packErr) {
-			if packErr.Orphaned {
-				orphanedPacks++
-				printer.V("%v\n", err)
-			} else {
+		for err := range errChan {
+			var packErr *repository.ErrPackMetadata
+			if errors.As(err, &packErr) {
+				if opts.PackRange != "" && !idRange.Contains(packErr.ID) {
+					printer.V("skipping out-of-range pack metadata result: %v\n", err)
+					continue
+				}
+				if packErr.Orphaned {
+					orphanedPacks++
+					printer.V("%v\n", err)
+					continue
+				}
+
 				if packErr.Truncated || packErr.Missing {
 					salvagePacks.Insert(packErr.ID)
 				}
+				result := checker.NewPackResult(packErr.ID, 0, err)
+				result.Status = checker.PackDamaged
+				findings.AddResult(result)
+				if checkpoint != nil {
+					if recordErr := checkpoint.Record(result); recordErr != nil {
+						printer.E("checkpoint write failed: %v\n", recordErr)
+					}
+				}
 				errorsFound = true
 				summary.NumErrors++
+				summary.Structure.Errors++
+				printer.E("%v\n", err)
+			} else {
+				errorsFound = true
+				summary.Structure.Errors++
 				printer.E("%v\n", err)
 			}
-		} else {
-			errorsFound = true
-			printer.E("%v\n", err)
 		}
-	}
 
-	if orphanedPacks > 0 {
-		summary.HintPrune = true
-		if !errorsFound {
-			// hide notice if repository is damaged
-			printer.P("%d additional files were found in the repo, which likely contain duplicate data.\nThis is non-critical, you can run `restic prune` to correct this.\n", orphanedPacks)
-		}
-	}
-	if ctx.Err() != nil {
-		return summary, ctx.Err()
-	}
-
-	printer.P("check snapshots, trees and blobs\n")
-	errChan = make(chan error)
-	var brokenSnapshots []string
-	var wg sync.WaitGroup
-
-	wg.Go(func() {
-		bar := printer.NewCounter("snapshots")
-		defer bar.Done()
-		chkr.Structure(ctx, bar, errChan)
-	})
-
-	for err := range errChan {
-		errorsFound = true
-		switch e := err.(type) {
-		case *checker.TreeError:
-			printer.E("error for tree %v:\n", e.ID.Str())
-			for _, treeErr := range e.Errors {
-				summary.NumErrors++
-				printer.E("  %v\n", treeErr)
+		if orphanedPacks > 0 {
+			summary.HintPrune = true
+			if !errorsFound {
+				// hide notice if repository is damaged
+				printer.P("%d additional files were found in the repo, which likely contain duplicate data.\nThis is non-critical, you can run `restic prune` to correct this.\n", orphanedPacks)
 			}
-		case *checker.SnapshotError:
-			printer.E("snapshot error %v: %v", e.ID, e.Message)
-			brokenSnapshots = append(brokenSnapshots, e.ID)
-		default:
-			summary.NumErrors++
-			printer.E("error: %v\n", err)
 		}
+		if ctx.Err() != nil {
+			return summary, ctx.Err()
+		}
+	} else {
+		printer.V("skipping structural pack metadata checks because --data-only is set\n")
 	}
 
-	// Wait for the progress bar to be complete before printing more below.
-	// Must happen after `errChan` is read from in the above loop to avoid
-	// deadlocking in the case of errors.
-	wg.Wait()
-	if ctx.Err() != nil {
-		return summary, ctx.Err()
+	var brokenSnapshots []string
+	if runStructure {
+		printer.P("check snapshots, trees and blobs\n")
+		errChan := make(chan error)
+		var wg sync.WaitGroup
+		structureCounter := &countingCounter{Counter: printer.NewCounter("snapshots")}
+
+		wg.Go(func() {
+			defer structureCounter.Done()
+			chkr.Structure(ctx, structureCounter, errChan)
+		})
+
+		for err := range errChan {
+			errorsFound = true
+			switch e := err.(type) {
+			case *checker.TreeError:
+				printer.E("error for tree %v:\n", e.ID.Str())
+				for _, treeErr := range e.Errors {
+					summary.NumErrors++
+					summary.Structure.Errors++
+					printer.E("  %v\n", treeErr)
+				}
+			case *checker.SnapshotError:
+				summary.NumErrors++
+				summary.Structure.Errors++
+				printer.E("snapshot error %v: %v", e.ID, e.Message)
+				brokenSnapshots = append(brokenSnapshots, e.ID)
+			default:
+				summary.NumErrors++
+				summary.Structure.Errors++
+				printer.E("error: %v\n", err)
+			}
+		}
+
+		// Wait for the progress bar to be complete before printing more below.
+		// Must happen after `errChan` is read from in the above loop to avoid
+		// deadlocking in the case of errors.
+		wg.Wait()
+		checked, total := structureCounter.totals()
+		summary.Structure.SnapshotsChecked = checked
+		summary.Structure.SnapshotsTotal = total
+		if summary.Structure.Errors > 0 {
+			summary.Structure.Status = "errors"
+		} else {
+			summary.Structure.Status = "ok"
+		}
+		printer.P("structure check: %d/%d snapshots/root trees checked, %d errors\n",
+			checked, total, summary.Structure.Errors)
+		if ctx.Err() != nil {
+			return summary, ctx.Err()
+		}
+	} else {
+		summary.Structure.Status = "not_run"
+		printer.P("structure check: skipped because --data-only was set\n")
 	}
 
 	// the following block only used for tests
-	if opts.CheckUnused {
+	if opts.CheckUnused && runStructure {
 		unused, err := chkr.UnusedBlobs(ctx)
 		if err != nil {
 			return summary, err
@@ -386,31 +592,172 @@ func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args
 		}
 	}
 
-	readDataFilter, err := buildPacksFilter(opts, printer, chkr.IsFiltered())
-	if err != nil {
-		return summary, err
-	}
+	if runData {
+		dataOpts := opts
+		if !dataOpts.ReadData && dataOpts.ReadDataSubset == "" {
+			// --data-only and --checkpoint without another selector mean all
+			// packs. --pack-range is handled by the composing filter below.
+			dataOpts.ReadData = opts.PackRange == ""
+		}
+		baseFilter, err := buildPacksFilter(dataOpts, printer, chkr.IsFiltered())
+		if err != nil {
+			return summary, err
+		}
+		if baseFilter == nil {
+			baseFilter = func(packs map[restic.ID]int64) map[restic.ID]int64 { return packs }
+		}
 
-	if readDataFilter != nil {
+		summary.Data.Scope = dataScope
+		summary.Data.Status = "ok"
+		summary.Data.Partial = opts.PackRange != "" || opts.ReadDataSubset != "" || chkr.IsFiltered()
+		var checkedCount atomic.Uint64
+		var verifiedBytes atomic.Int64
+		reusedProblemPacks := restic.NewIDSet()
+
+		packFilter := func(allPacks map[restic.ID]int64) map[restic.ID]int64 {
+			summary.Data.PacksTotal = len(allPacks)
+			scopedPacks := allPacks
+			if opts.PackRange != "" {
+				scopedPacks = selectPacksByRange(allPacks, idRange)
+			}
+			selectedPacks := baseFilter(scopedPacks)
+			summary.Data.PacksSelected = len(selectedPacks)
+			summary.Data.PacksOutOfScope = summary.Data.PacksTotal - summary.Data.PacksSelected
+
+			packsToCheck := make(map[restic.ID]int64, len(selectedPacks))
+			resumed := 0
+			reusedErrors := 0
+			for id, size := range selectedPacks {
+				if checkpoint != nil {
+					if result, ok := checkpoint.Result(id); ok {
+						if opts.RetryFailed && result.Status != checker.PackVerified {
+							packsToCheck[id] = size
+							continue
+						}
+
+						resumed++
+						if result.Status != checker.PackVerified {
+							reusedErrors++
+							reusedProblemPacks.Insert(id)
+							if result.Status == checker.PackDamaged {
+								salvagePacks.Insert(id)
+							}
+						}
+						continue
+					}
+				}
+				packsToCheck[id] = size
+			}
+			summary.Data.PacksResumed = resumed
+			summary.Data.PacksReusedErrors = reusedErrors
+			return packsToCheck
+		}
+
 		errChan := make(chan error)
-
-		go chkr.ReadPacks(ctx, readDataFilter, printer, errChan)
+		go chkr.ReadPacksWithOptions(ctx, checker.ReadPacksOptions{
+			Filter:      packFilter,
+			Printer:     printer,
+			Concurrency: opts.Concurrency,
+			OnPackComplete: func(id restic.ID, size int64, packErr error) {
+				checkedCount.Add(1)
+				if packErr == nil {
+					verifiedBytes.Add(size)
+				}
+				result := findings.Record(id, size, packErr)
+				if checkpoint != nil {
+					if recordErr := checkpoint.Record(result); recordErr != nil {
+						printer.E("checkpoint write failed: %v\n", recordErr)
+					}
+				}
+			},
+		}, errChan)
 
 		for err := range errChan {
 			errorsFound = true
 			summary.NumErrors++
+			summary.Data.Errors++
 			printer.E("%v\n", err)
-			if err, ok := err.(*repository.ErrPackData); ok {
-				salvagePacks.Insert(err.PackID)
+			var packDataErr *repository.ErrPackData
+			if errors.As(err, &packDataErr) {
+				salvagePacks.Insert(packDataErr.PackID)
+			}
+		}
+
+		for _, packID := range reusedProblemPacks.List() {
+			status := "failed"
+			if result, ok := checkpoint.Result(packID); ok {
+				status = string(result.Status)
+			}
+			errorsFound = true
+			summary.NumErrors++
+			summary.Data.Errors++
+			printer.E("pack %s: reusing %s result from checkpoint; pass --retry-failed to verify it again\n",
+				packID, status)
+		}
+
+		summary.Data.PacksChecked = int(checkedCount.Load())
+		summary.Data.BytesVerified = verifiedBytes.Load()
+		if summary.Data.Errors > 0 {
+			summary.Data.Status = "errors"
+		}
+		printer.P("data check: %d packs selected, %d checked now, %d resumed from checkpoint, %d errors\n",
+			summary.Data.PacksSelected, summary.Data.PacksChecked, summary.Data.PacksResumed, summary.Data.Errors)
+		if gopts.Limits.DownloadKb > 0 {
+			printer.P("download bandwidth was limited to %d KiB/s by --limit-download\n", gopts.Limits.DownloadKb)
+		}
+		if ctx.Err() != nil {
+			return summary, ctx.Err()
+		}
+		summary.Data.Complete = true
+	} else {
+		summary.Data.Status = "not_run"
+		printer.P("data check: skipped (use --read-data, --read-data-subset, --pack-range or --data-only)\n")
+	}
+
+	problemResults := findings.Results()
+	if checkpoint != nil {
+		problemResults = checkpoint.Results()
+	}
+	var damagedIDs []string
+	damagedCount, failedCount := 0, 0
+	for _, result := range problemResults {
+		if result.Status == checker.PackVerified {
+			continue
+		}
+		damagedIDs = append(damagedIDs, result.ID)
+		if result.Status == checker.PackDamaged {
+			damagedCount++
+		} else {
+			failedCount++
+		}
+	}
+	sort.Strings(damagedIDs)
+	summary.Data.DamagedPacks = damagedIDs
+	summary.Data.PacksDamaged = damagedCount
+	summary.Data.PacksFailed = failedCount
+
+	if len(damagedIDs) > 0 {
+		printer.E("\nDamaged or unreadable packs (restic has not deleted or modified any data):\n")
+		for _, result := range problemResults {
+			if result.Status == checker.PackVerified {
+				continue
+			}
+			if result.Error != "" {
+				printer.E("  %s [%s]: %s\n", result.ID, result.Status, result.Error)
+			} else {
+				printer.E("  %s [%s]\n", result.ID, result.Status)
 			}
 		}
 	}
 
 	if len(salvagePacks) > 0 {
 		printer.E("\nThe repository contains damaged pack files. These damaged files must be removed to repair the repository. This can be done using the following commands. Please read the troubleshooting guide at https://restic.readthedocs.io/en/stable/077_troubleshooting.html first.\n\n")
+		salvageIDs := make([]string, 0, len(salvagePacks))
 		for id := range salvagePacks {
-			summary.BrokenPacks = append(summary.BrokenPacks, id.String())
+			salvageIDs = append(salvageIDs, id.String())
 		}
+		sort.Strings(salvageIDs)
+		summary.BrokenPacks = salvageIDs
 		printer.E("restic repair packs %v\nrestic repair snapshots --forget\n\n", strings.Join(summary.BrokenPacks, " "))
 		printer.E("Damaged pack files can be caused by backend problems, hardware problems or bugs in restic. Please open an issue at https://github.com/restic/restic/issues/new/choose for further troubleshooting!\n")
 	}
@@ -431,7 +778,14 @@ func runCheck(ctx context.Context, opts CheckOptions, gopts global.Options, args
 		}
 		return summary, errors.Fatal("repository contains errors")
 	}
-	printer.P("no errors were found\n")
+	if runData && summary.Data.PacksTotal > summary.Data.PacksSelected {
+		printer.P("no errors were found in the selected scope; %d pack(s) outside that scope were not checked and do not affect this conclusion\n",
+			summary.Data.PacksTotal-summary.Data.PacksSelected)
+	} else if opts.PackRange != "" || opts.ReadDataSubset != "" {
+		printer.P("no errors were found in the selected scope\n")
+	} else {
+		printer.P("no errors were found\n")
+	}
 	return summary, nil
 }
 
@@ -493,6 +847,17 @@ func buildPacksFilter(opts CheckOptions, printer restic.Printer,
 	return nil, nil
 }
 
+// packRange is the command-level alias for the reusable checker range type.
+type packRange = checker.PackRange
+
+func parsePackRange(s string) (packRange, error) {
+	return checker.ParsePackRange(s)
+}
+
+func selectPacksByRange(packs map[restic.ID]int64, r packRange) map[restic.ID]int64 {
+	return checker.SelectPacksByRange(packs, r)
+}
+
 // selectPacksByBucket selects subsets of packs by ranges of buckets.
 func selectPacksByBucket(allPacks map[restic.ID]int64, bucket, totalBuckets uint) map[restic.ID]int64 {
 	packs := make(map[restic.ID]int64)
@@ -538,16 +903,111 @@ func selectRandomPacksByFileSize(allPacks map[restic.ID]int64, subsetSize int64,
 }
 
 type checkSummary struct {
-	MessageType     string   `json:"message_type"` // "summary"
-	NumErrors       int      `json:"num_errors"`
-	BrokenPacks     []string `json:"broken_packs"`         // run "restic repair packs ID..." and "restic repair snapshots --forget" to remove damaged files
-	HintRepairIndex bool     `json:"suggest_repair_index"` // run "restic repair index"
-	HintPrune       bool     `json:"suggest_prune"`        // run "restic prune"
+	MessageType     string                 `json:"message_type"` // "summary"
+	NumErrors       int                    `json:"num_errors"`
+	BrokenPacks     []string               `json:"broken_packs"`         // run "restic repair packs ID..." and "restic repair snapshots --forget" to remove damaged files
+	HintRepairIndex bool                   `json:"suggest_repair_index"` // run "restic repair index"
+	HintPrune       bool                   `json:"suggest_prune"`        // run "restic prune"
+	Structure       *structureCheckSummary `json:"structure,omitempty"`
+	Data            *dataCheckSummary      `json:"data,omitempty"`
+}
+
+type structureCheckSummary struct {
+	Status           string `json:"status"` // "not_run", "ok", or "errors"
+	Errors           int    `json:"errors"`
+	SnapshotsTotal   uint64 `json:"snapshots_total"`
+	SnapshotsChecked uint64 `json:"snapshots_checked"`
+}
+
+type dataCheckSummary struct {
+	Status            string   `json:"status"` // "not_run", "ok", or "errors"
+	Errors            int      `json:"errors"`
+	Scope             string   `json:"scope,omitempty"`
+	Partial           bool     `json:"partial"`
+	Complete          bool     `json:"complete"`
+	PacksTotal        int      `json:"packs_total"`
+	PacksSelected     int      `json:"packs_selected"`
+	PacksOutOfScope   int      `json:"packs_out_of_scope"`
+	PacksChecked      int      `json:"packs_checked"`
+	PacksResumed      int      `json:"packs_resumed"`
+	PacksReusedErrors int      `json:"packs_reused_errors"`
+	PacksDamaged      int      `json:"packs_damaged"`
+	PacksFailed       int      `json:"packs_failed"`
+	BytesVerified     int64    `json:"bytes_verified"`
+	DamagedPacks      []string `json:"damaged_packs,omitempty"`
+	CheckpointFile    string   `json:"checkpoint_file,omitempty"`
+	ReportFile        string   `json:"report_file,omitempty"`
 }
 
 type checkError struct {
 	MessageType string `json:"message_type"` // "error"
 	Message     string `json:"message"`
+}
+
+// packResultTracker collects results for packs checked in this process. It is
+// used even when no checkpoint file was requested and backs the damage report.
+type packResultTracker struct {
+	mu      sync.Mutex
+	results map[restic.ID]checker.PackResult
+}
+
+func newPackResultTracker() *packResultTracker {
+	return &packResultTracker{results: make(map[restic.ID]checker.PackResult)}
+}
+
+func (t *packResultTracker) Record(id restic.ID, size int64, err error) checker.PackResult {
+	result := checker.NewPackResult(id, size, err)
+	t.mu.Lock()
+	t.results[id] = result
+	t.mu.Unlock()
+	return result
+}
+
+func (t *packResultTracker) AddResult(result checker.PackResult) {
+	id, err := restic.ParseID(result.ID)
+	if err != nil {
+		return
+	}
+	t.mu.Lock()
+	t.results[id] = result
+	t.mu.Unlock()
+}
+
+func (t *packResultTracker) Results() []checker.PackResult {
+	t.mu.Lock()
+	results := make([]checker.PackResult, 0, len(t.results))
+	for _, result := range t.results {
+		results = append(results, result)
+	}
+	t.mu.Unlock()
+	sort.Slice(results, func(i, j int) bool { return results[i].ID < results[j].ID })
+	return results
+}
+
+// countingCounter retains exact totals even in JSON mode, where the printer
+// returns a no-op progress counter.
+type countingCounter struct {
+	restic.Counter
+	max  uint64
+	done uint64
+}
+
+func (c *countingCounter) Add(n uint64) {
+	atomic.AddUint64(&c.done, n)
+	if c.Counter != nil {
+		c.Counter.Add(n)
+	}
+}
+
+func (c *countingCounter) SetMax(n uint64) {
+	atomic.StoreUint64(&c.max, n)
+	if c.Counter != nil {
+		c.Counter.SetMax(n)
+	}
+}
+
+func (c *countingCounter) totals() (done, max uint64) {
+	return atomic.LoadUint64(&c.done), atomic.LoadUint64(&c.max)
 }
 
 type jsonErrorPrinter struct {
