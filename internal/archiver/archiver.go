@@ -130,6 +130,18 @@ type Archiver struct {
 	// Flags controlling change detection. See doc/040_backup.rst for details.
 	ChangeIgnoreFlags uint
 
+	// ChangeJournal, when non-nil, records files that changed while they were
+	// being read. Pending records are associated with the next snapshot.
+	ChangeJournal ChangeJournal
+
+	// ReadChangeHandler, when set, is called for every detected read change
+	// after it has been recorded. It may be called concurrently.
+	ReadChangeHandler func(ReadChange)
+
+	// handleSlots bounds actually opened readable file handles. It is
+	// initialized from Options.MaxOpenFiles and must not be copied after use.
+	handleSlots *fs.HandlePool
+
 	// for excluded items
 	ExcludedItem func(path string)
 }
@@ -147,6 +159,15 @@ type Options struct {
 	// turned out to be a good default for most situations).
 	ReadConcurrency uint
 
+	// MaxOpenFiles bounds the number of file handles opened for file data.
+	// Requests beyond the limit wait for a handle slot instead of failing
+	// with "too many open files". If zero, ReadConcurrency is used.
+	MaxOpenFiles uint
+
+	// ReadBlockSize is the buffer size used for streaming file reads. If
+	// zero, chunkReadBufSize is used.
+	ReadBlockSize int
+
 	// SaveTreeConcurrency sets how many trees are marshalled and saved to the
 	// repo concurrently.
 	SaveTreeConcurrency uint
@@ -160,6 +181,14 @@ func (o Options) applyDefaults() Options {
 		// experiments documented here:
 		// https://github.com/borgbackup/borg/issues/3500
 		o.ReadConcurrency = 2
+	}
+
+	if o.MaxOpenFiles == 0 {
+		o.MaxOpenFiles = o.ReadConcurrency
+	}
+
+	if o.ReadBlockSize <= 0 {
+		o.ReadBlockSize = chunkReadBufSize
 	}
 
 	if o.SaveTreeConcurrency == 0 {
@@ -176,12 +205,15 @@ func (o Options) applyDefaults() Options {
 
 // New initializes a new archiver.
 func New(repo archiverRepo, filesystem fs.FS, opts Options) *Archiver {
+	opts = opts.applyDefaults()
 	arch := &Archiver{
-		Repo:         repo,
-		SelectByName: func(_ string) bool { return true },
-		Select:       func(_ string, _ *fs.ExtendedFileInfo, _ fs.FS) bool { return true },
-		FS:           filesystem,
-		Options:      opts.applyDefaults(),
+		Repo:          repo,
+		SelectByName:  func(_ string) bool { return true },
+		Select:        func(_ string, _ *fs.ExtendedFileInfo, _ fs.FS) bool { return true },
+		FS:            filesystem,
+		Options:       opts,
+		ChangeJournal: NewMemoryChangeJournal(),
+		handleSlots:   fs.NewHandlePool(int(opts.MaxOpenFiles)),
 
 		CompleteItem: func(string, ItemAction, ItemStats, time.Duration) {},
 		StartFile:    func(string) {},
@@ -212,6 +244,55 @@ func (arch *Archiver) error(item string, err error) error {
 		debug.Log("item %v: error was filtered by handler, before: %q, after: %v", item, err, errf)
 	}
 	return errf
+}
+
+// recordReadChange persists and reports a concurrent file modification. The
+// observation remains pending until a later Snapshot associates it with the
+// new snapshot ID.
+func (arch *Archiver) recordReadChange(ctx context.Context, change ReadChange) {
+	if change.DetectedAt.IsZero() {
+		change.DetectedAt = time.Now()
+	}
+
+	recorded := change
+	if arch.ChangeJournal != nil {
+		var err error
+		recorded, err = arch.ChangeJournal.RecordReadChange(ctx, change)
+		if err != nil {
+			debug.Log("recording read change for %v failed: %v", change.Path, err)
+			_ = arch.error(change.Path, err)
+		}
+	}
+
+	if arch.ReadChangeHandler != nil {
+		arch.ReadChangeHandler(recorded)
+	}
+
+	// Route through the normal item error handler so CLI users get a warning
+	// and the backup exits with "some source files could not be read", while
+	// a nil/continuing handler still lets the snapshot finish.
+	_ = arch.error(change.Path, &ReadChangeError{Change: recorded})
+}
+
+// makeReadable acquires a bounded handle slot and reopens meta for reading.
+// The returned File releases the slot when Closed.
+func (arch *Archiver) makeReadable(ctx context.Context, meta fs.File) (fs.File, error) {
+	pool := arch.handleSlots
+	if pool == nil {
+		if err := meta.MakeReadable(); err != nil {
+			return nil, err
+		}
+		return meta, nil
+	}
+
+	if err := pool.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	if err := meta.MakeReadable(); err != nil {
+		pool.Release()
+		return nil, err
+	}
+	return pool.OnClose(meta), nil
 }
 
 func (arch *Archiver) trackItem(item string, previous, current *data.Node, s ItemStats, d time.Duration) {
@@ -555,12 +636,16 @@ func (arch *Archiver) save(ctx context.Context, snPath, target string, previous 
 		}
 
 		// reopen file and do an fstat() on the open file to check it is still
-		// a file (and has not been exchanged for e.g. a symlink)
-		err := meta.MakeReadable()
+		// a file (and has not been exchanged for e.g. a symlink). Acquiring a
+		// handle slot before opening ensures that the number of concurrently
+		// open data files stays below the configured limit; callers queue here
+		// instead of receiving EMFILE.
+		readable, err := arch.makeReadable(ctx, meta)
 		if err != nil {
 			debug.Log("MakeReadable() for %v returned error: %v", target, err)
 			return filterError(err)
 		}
+		meta = readable
 
 		fi, err := meta.Stat()
 		if err != nil {
@@ -862,12 +947,15 @@ func (arch *Archiver) loadParentTree(ctx context.Context, sn *data.Snapshot) dat
 
 // runWorkers starts the worker pools, which are stopped when the context is cancelled.
 func (arch *Archiver) runWorkers(ctx context.Context, wg *errgroup.Group, uploader restic.BlobSaverAsync) {
-	arch.fileSaver = newFileSaver(ctx, wg,
+	arch.fileSaver = newFileSaverWithBlockSize(ctx, wg,
 		uploader,
 		arch.Repo.ChunkerFactory(),
-		arch.Options.ReadConcurrency)
+		arch.Options.ReadConcurrency,
+		arch.Options.ReadBlockSize)
 	arch.fileSaver.CompleteBlob = arch.CompleteBlob
 	arch.fileSaver.NodeFromFileInfo = arch.nodeFromFileInfo
+	arch.fileSaver.filesys = arch.FS
+	arch.fileSaver.onReadChange = arch.recordReadChange
 
 	arch.treeSaver = newTreeSaver(ctx, wg, arch.Options.SaveTreeConcurrency, uploader, arch.Error)
 }
@@ -883,6 +971,18 @@ func (arch *Archiver) stopWorkers() {
 func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts SnapshotOptions) (*data.Snapshot, restic.ID, *Summary, error) {
 	arch.summary = &Summary{
 		BackupStart: opts.BackupStart,
+	}
+	runStarted := time.Now()
+
+	// Capture observations from earlier runs. Observations produced by this
+	// run must stay pending until the snapshot after this one.
+	var previousPendingChanges []ReadChange
+	if arch.ChangeJournal != nil {
+		var err error
+		previousPendingChanges, err = arch.ChangeJournal.PendingReadChanges(ctx)
+		if err != nil {
+			return nil, restic.ID{}, nil, err
+		}
 	}
 
 	cleanTargets, err := resolveRelativeTargets(arch.FS, targets)
@@ -984,6 +1084,23 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 	id, err := data.SaveSnapshot(ctx, arch.Repo, sn)
 	if err != nil {
 		return nil, restic.ID{}, nil, err
+	}
+
+	if arch.ChangeJournal != nil && len(previousPendingChanges) > 0 {
+		if err := arch.ChangeJournal.AssociateReadChanges(ctx, id, previousPendingChanges); err != nil {
+			// The snapshot itself was saved successfully. Do not discard it;
+			// surface the journal failure through the item error handler.
+			if handlerErr := arch.error("/", err); handlerErr != nil {
+				return sn, id, arch.summary, handlerErr
+			}
+		}
+	}
+	if tagger, ok := arch.ChangeJournal.(detectedSnapshotJournal); ok {
+		if err := tagger.TagDetectedSnapshot(ctx, id, runStarted); err != nil {
+			if handlerErr := arch.error("/", err); handlerErr != nil {
+				return sn, id, arch.summary, handlerErr
+			}
+		}
 	}
 
 	return sn, id, arch.summary, nil

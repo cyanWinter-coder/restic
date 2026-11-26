@@ -1,0 +1,20 @@
+Enhancement: Harden backups of changing files and large file counts
+
+Restic now compares a regular file's size and modification time immediately
+before and after reading it. If the file changes or disappears during the read,
+the mismatch is reported and recorded in a change journal. Pending records are
+associated with the next successful snapshot; the journal location can be
+overridden with `--change-journal`.
+
+Backups with many small files can use `--max-open-files` to bound the number of
+open file handles. Additional files wait for a free slot instead of failing with
+"too many open files". The read buffer/block size is configurable with
+`--read-block-size`; file read concurrency remains configurable with
+`--read-concurrency`.
+
+Permission and disappearance errors continue to be reported while allowing the
+remaining backup to proceed. Cancellation prevents new work from being queued
+and waits for active workers to finish; completed packs are stored atomically
+and are not truncated by cancellation.
+
+https://github.com/restic/restic/issues/2566

@@ -86,6 +86,18 @@ by reading more files in parallel. You can specify the concurrency of file reads
 ``RESTIC_READ_CONCURRENCY`` environment variable or the ``--read-concurrency`` option of
 the ``backup`` command.
 
+Use ``--max-open-files`` to cap the number of file handles used for file data. Files that
+exceed the limit wait for a free handle instead of failing with *too many open files*. By
+default, the handle limit equals the read concurrency. Large files are streamed in blocks;
+the block size can be changed with ``--read-block-size``.
+
+If a file's size or modification time changes between the stat before reading and the
+check after reading, restic reports the file and records the observation in a JSON change
+journal. Pending observations are attached to the next successful snapshot. The journal
+defaults to the local cache state for the repository and can be overridden with
+``--change-journal``. Permission errors and files that disappear while being processed are
+reported, but do not abort the rest of the backup.
+
 
 .. _pack_size:
 

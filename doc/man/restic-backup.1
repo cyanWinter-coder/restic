@@ -24,6 +24,10 @@ Exit status is 12 if the password is incorrect.
 
 
 .SH OPTIONS
+\fB--change-journal\fP=""
+	persist read-change records in \fBfile\fR for association with the next snapshot (default: per-repository cache state)
+
+.PP
 \fB-n\fP, \fB--dry-run\fP[=false]
 	do not upload or write any data, just show what would be done
 
@@ -92,6 +96,10 @@ Exit status is 12 if the password is incorrect.
 	ignore inode number and ctime changes when checking for modified files (default: $RESTIC_IGNORE_INODE or false)
 
 .PP
+\fB--max-open-files\fP=0
+	keep at most \fBn\fR file handles open for file data and queue additional files (default: --read-concurrency)
+
+.PP
 \fB--no-scan\fP[=false]
 	do not run scanner to estimate size of backup
 
@@ -102,6 +110,10 @@ Exit status is 12 if the password is incorrect.
 .PP
 \fB--parent\fP=""
 	use this parent \fBsnapshot\fR (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time)
+
+.PP
+\fB--read-block-size\fP=""
+	read large files in blocks of \fBsize\fR (allowed suffixes: k/K, m/M, g/G; default: 512KiB)
 
 .PP
 \fB--read-concurrency\fP=0

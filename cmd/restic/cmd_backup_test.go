@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/pflag"
+
 	"github.com/restic/restic/internal/errors"
 	rtest "github.com/restic/restic/internal/test"
 )
@@ -138,4 +140,19 @@ func TestReadFilenamesRaw(t *testing.T) {
 	rtest.Assert(t, err != nil, "no error for zero byte")
 	rtest.Assert(t, strings.Contains(err.Error(), "zero byte"),
 		"wrong error message: %v", err.Error())
+}
+
+func TestBackupOptionsReadBlockSize(t *testing.T) {
+	flags := pflag.NewFlagSet("backup-test", pflag.ContinueOnError)
+	opts := BackupOptions{}
+	opts.AddFlags(flags)
+	rtest.OK(t, flags.Set("read-block-size", "4096"))
+	rtest.OK(t, opts.Finalize())
+	rtest.Equals(t, 4096, opts.parsedBlockSize)
+
+	flags = pflag.NewFlagSet("backup-test-invalid", pflag.ContinueOnError)
+	opts = BackupOptions{}
+	opts.AddFlags(flags)
+	rtest.OK(t, flags.Set("read-block-size", "not-a-size"))
+	rtest.Assert(t, opts.Finalize() != nil, "expected invalid block size to fail")
 }

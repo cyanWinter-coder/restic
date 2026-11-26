@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
@@ -24,6 +26,15 @@ type fileSaver struct {
 
 	ch chan<- saveFileJob
 
+	// filesys is used for a final path-based stat after reading. When nil,
+	// the open file description is stat'ed instead.
+	filesys fs.FS
+
+	// onReadChange is invoked for a size/mtime mismatch after reading.
+	onReadChange func(context.Context, ReadChange)
+
+	readBlockSize int
+
 	CompleteBlob func(bytes uint64)
 
 	NodeFromFileInfo func(snPath, filename string, meta toNoder, ignoreXattrListError bool) (*data.Node, error)
@@ -32,13 +43,21 @@ type fileSaver struct {
 // newFileSaver returns a new file saver. A worker pool with fileWorkers is
 // started, it is stopped when ctx is cancelled.
 func newFileSaver(ctx context.Context, wg *errgroup.Group, uploader restic.BlobSaverAsync, chunkerFactory restic.ChunkerFactory, fileWorkers uint) *fileSaver {
+	return newFileSaverWithBlockSize(ctx, wg, uploader, chunkerFactory, fileWorkers, chunkReadBufSize)
+}
+
+func newFileSaverWithBlockSize(ctx context.Context, wg *errgroup.Group, uploader restic.BlobSaverAsync, chunkerFactory restic.ChunkerFactory, fileWorkers uint, readBlockSize int) *fileSaver {
 	ch := make(chan saveFileJob)
 	debug.Log("new file saver with %v file workers", fileWorkers)
 
+	if readBlockSize <= 0 {
+		readBlockSize = chunkReadBufSize
+	}
 	s := &fileSaver{
 		uploader:       uploader,
 		chunkerFactory: chunkerFactory,
 		ch:             ch,
+		readBlockSize:  readBlockSize,
 
 		CompleteBlob: func(uint64) {},
 	}
@@ -202,6 +221,16 @@ func (s *fileSaver) saveFile(ctx context.Context, chnker restic.Chunker, chunkSt
 
 	debug.Log("%v", snPath)
 
+	// Snapshot size and mtime immediately before reading. The matching
+	// post-read check catches concurrent rewrites that would otherwise produce
+	// an internally inconsistent backup without any diagnostic.
+	beforeFI, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		completeError(err)
+		return
+	}
+
 	node, err := s.NodeFromFileInfo(snPath, target, f, false)
 	if err != nil {
 		_ = f.Close()
@@ -284,6 +313,12 @@ func (s *fileSaver) saveFile(ctx context.Context, chnker restic.Chunker, chunkSt
 		s.CompleteBlob(uint64(chunkSize))
 	}
 
+	if s.onReadChange != nil {
+		if change := detectReadChange(target, f, beforeFI, s.filesys); change != nil {
+			s.onReadChange(ctx, *change)
+		}
+	}
+
 	err = f.Close()
 	if err != nil {
 		completeError(err)
@@ -300,9 +335,72 @@ func (s *fileSaver) saveFile(ctx context.Context, chnker restic.Chunker, chunkSt
 	completeBlob()
 }
 
+func detectReadChange(target string, f fs.File, before *fs.ExtendedFileInfo, pathFS fs.FS) *ReadChange {
+	if before == nil {
+		return nil
+	}
+
+	change := &ReadChange{
+		Path:       target,
+		Before:     fileStateFromFI(before),
+		DetectedAt: time.Now(),
+	}
+
+	changed := false
+
+	// Stat the open description first. Some fs.File implementations cache the
+	// FileInfo from before reading, so the path Lstat below is the authoritative
+	// post-read comparison and also detects replacement via rename.
+	if afterHandle, err := f.Stat(); err == nil && afterHandle != nil {
+		if before.Size != afterHandle.Size || !before.ModTime.Equal(afterHandle.ModTime) {
+			changed = true
+			change.After = fileStateFromFI(afterHandle)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		change.StatError = err.Error()
+		changed = true
+	}
+
+	// A path stat additionally detects replacement via rename, where the old
+	// open description continues to refer to the unlinked original inode.
+	if pathFS != nil {
+		afterPath, err := pathFS.Lstat(target)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			change.Deleted = true
+			changed = true
+		case err != nil:
+			change.StatError = err.Error()
+			changed = true
+		case afterPath != nil:
+			state := fileStateFromFI(afterPath)
+			if before.Size != afterPath.Size || !before.ModTime.Equal(afterPath.ModTime) {
+				changed = true
+			}
+			if change.After == (FileState{}) {
+				change.After = state
+			}
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+	if change.After == (FileState{}) && !change.Deleted {
+		// Keep the before state usable in diagnostics if only stat metadata
+		// could not be retrieved.
+		change.After = change.Before
+	}
+	return change
+}
+
 func (s *fileSaver) worker(ctx context.Context, jobs <-chan saveFileJob) {
 	chnker := s.chunkerFactory.NewChunker()
-	chunkState := &fileChunkState{readBuf: make([]byte, chunkReadBufSize)}
+	blockSize := s.readBlockSize
+	if blockSize <= 0 {
+		blockSize = chunkReadBufSize
+	}
+	chunkState := &fileChunkState{readBuf: make([]byte, blockSize)}
 
 	for {
 		var job saveFileJob

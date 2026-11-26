@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/restic/restic/internal/archiver"
+	"github.com/restic/restic/internal/backend/cache"
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
@@ -94,10 +95,14 @@ type BackupOptions struct {
 	UseFsSnapshot     bool
 	DryRun            bool
 	ReadConcurrency   uint
+	MaxOpenFiles      uint
+	ReadBlockSize     string
+	ChangeJournal     string
 	NoScan            bool
 	SkipIfUnchanged   bool
 
 	readConcurrencyFlag *pflag.Flag
+	parsedBlockSize     int
 }
 
 func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
@@ -117,6 +122,9 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
 	f.Var(&opts.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.UintVar(&opts.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
+	f.UintVar(&opts.MaxOpenFiles, "max-open-files", 0, "keep at most `n` file handles open for file data and queue additional files (default: --read-concurrency)")
+	f.StringVar(&opts.ReadBlockSize, "read-block-size", "", "read large files in blocks of `size` (allowed suffixes: k/K, m/M, g/G; default: 512KiB)")
+	f.StringVar(&opts.ChangeJournal, "change-journal", "", "persist read-change records in `file` for association with the next snapshot (default: per-repository cache state)")
 	f.StringVarP(&opts.Host, "host", "H", "", "set the `hostname` for the snapshot manually (default: $RESTIC_HOST). To prevent an expensive rescan use the \"parent\" flag")
 	f.StringVar(&opts.Host, "hostname", "", "set the `hostname` for the snapshot manually")
 	err := f.MarkDeprecated("hostname", "use --host")
@@ -160,6 +168,17 @@ func (opts *BackupOptions) Finalize() error {
 			return errors.Fatalf("invalid value for RESTIC_READ_CONCURRENCY %q: %v", envVal, err)
 		}
 		opts.ReadConcurrency = uint(n)
+	}
+
+	if opts.ReadBlockSize != "" {
+		size, err := ui.ParseBytes(opts.ReadBlockSize)
+		if err != nil {
+			return errors.Fatalf("invalid --read-block-size %q: %v", opts.ReadBlockSize, err)
+		}
+		if size <= 0 || size > int64(^uint(0)>>1) {
+			return errors.Fatalf("invalid --read-block-size %q: size out of range", opts.ReadBlockSize)
+		}
+		opts.parsedBlockSize = int(size)
 	}
 	if opts.Host == "" {
 		hostname, err := os.Hostname()
@@ -651,7 +670,28 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		wg.Go(func() error { return sc.Scan(cancelCtx, targets) })
 	}
 
-	arch := archiver.New(repo, targetFS, archiver.Options{ReadConcurrency: opts.ReadConcurrency})
+	arch := archiver.New(repo, targetFS, archiver.Options{
+		ReadConcurrency: opts.ReadConcurrency,
+		MaxOpenFiles:    opts.MaxOpenFiles,
+		ReadBlockSize:   opts.parsedBlockSize,
+	})
+
+	journalPath := opts.ChangeJournal
+	if journalPath == "" {
+		cacheBase := gopts.CacheDir
+		if cacheBase == "" {
+			cacheBase, err = cache.DefaultDir()
+			if err != nil {
+				debug.Log("unable to determine change journal directory: %v", err)
+			}
+		}
+		if cacheBase != "" {
+			journalPath = filepath.Join(cacheBase, "backup-state", repo.Config().ID+".read-changes.json")
+		}
+	}
+	if journalPath != "" {
+		arch.ChangeJournal = archiver.NewFileChangeJournal(journalPath)
+	}
 	arch.SelectByName = selectByNameFilter
 	arch.Select = selectFilter
 	arch.WithAtime = opts.WithAtime
