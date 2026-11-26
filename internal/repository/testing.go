@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/backend/local"
@@ -203,4 +204,10 @@ func TestInjectKey(t testing.TB, keyID restic.ID, key string) {
 		t.Fatal(err)
 	}
 	testKeyInjection.Store(keyID, &k)
+}
+
+// TestUseFastUploadBackoff makes pack upload retries in tests use a short,
+// fixed delay instead of the production exponential backoff.
+func TestUseFastUploadBackoff(repo *Repository) {
+	repo.uploadBackoff = func(_ uint) time.Duration { return time.Millisecond }
 }

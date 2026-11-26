@@ -78,6 +78,10 @@ type archiverRepo interface {
 	restic.SaverUnpacked[restic.WriteableFileType]
 
 	ChunkerFactory() restic.ChunkerFactory
+
+	// CleanupOrphanPacks removes pack files that are not referenced by any
+	// index, typically leftovers from an interrupted previous backup.
+	CleanupOrphanPacks(ctx context.Context) error
 }
 
 // Archiver saves a directory structure to the repo.
@@ -896,6 +900,11 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 	}
 
 	var rootTreeID restic.ID
+
+	// remove packs left behind by an interrupted backup before writing new data
+	if err := arch.Repo.CleanupOrphanPacks(ctx); err != nil {
+		return nil, restic.ID{}, nil, fmt.Errorf("cleaning up orphaned packs: %w", err)
+	}
 
 	err = arch.Repo.WithBlobUploader(ctx, func(ctx context.Context, uploader restic.BlobSaverWithAsync) error {
 		wg, wgCtx := errgroup.WithContext(ctx)

@@ -1,0 +1,11 @@
+Enhancement: Make pack uploads resilient and clean up orphaned packs
+
+Backing up a repository with high write concurrency could leave duplicate
+or orphaned pack files in the backend when an upload failed after the data
+was already stored, and retrying could upload the same pack twice. Restic
+now retries failed pack uploads with an exponential backoff, skips a pack
+that is already present in the backend, and tracks open pack handles so
+that each pack is uploaded at most once. Packs left behind by an
+interrupted backup are detected and removed at the start of the next
+backup. Underfilled packs are flushed on shutdown and their temporary
+files are released on error paths.

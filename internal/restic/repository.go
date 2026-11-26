@@ -58,6 +58,10 @@ type Repository interface {
 
 	// StartWarmup creates a new warmup job, requesting the backend to warmup the specified packs.
 	StartWarmup(ctx context.Context, packs IDSet) (WarmupJob, error)
+
+	// CleanupOrphanPacks removes pack files that are not referenced by any
+	// index, typically leftovers from an interrupted previous backup.
+	CleanupOrphanPacks(ctx context.Context) error
 }
 
 // LoaderUnpacked allows loading a blob not stored in a pack file

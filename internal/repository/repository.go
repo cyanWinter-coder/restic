@@ -8,6 +8,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/restic/chunker"
@@ -56,6 +57,10 @@ type Repository struct {
 	zeroChunkID   restic.ID
 
 	blobBuffers *restic.BlobBufferPool
+
+	// uploadBackoff, when set, overrides the exponential backoff used when
+	// retrying failed pack uploads. It exists mainly to keep tests fast.
+	uploadBackoff func(attempt uint) time.Duration
 }
 
 // internalRepository allows using SaveUnpacked and RemoveUnpacked with all FileTypes
@@ -626,6 +631,9 @@ func (r *Repository) startPackUploader(ctx context.Context, wg *errgroup.Group) 
 	innerWg, ctx := errgroup.WithContext(ctx)
 	r.packerWg = innerWg
 	r.uploader = newPackerUploader(ctx, innerWg, r, r.Connections())
+	if r.uploadBackoff != nil {
+		r.uploader.backoff = r.uploadBackoff
+	}
 	r.treePM = newPackerManager(r.key, restic.TreeBlob, r.PackSize(), r.packerCount, r.uploader.QueuePacker)
 	r.dataPM = newPackerManager(r.key, restic.DataBlob, r.PackSize(), r.packerCount, r.uploader.QueuePacker)
 
@@ -676,23 +684,56 @@ func (r *Repository) flushPackUploader(ctx context.Context) error {
 		return nil
 	}
 
+	// On every exit path, release temp files that never made it to the backend:
+	// discardOpenPackers() handles packs still owned by a packer manager, while
+	// uploader.DiscardPending() handles packs that were handed to the uploader
+	// but did not finish. Both are no-ops for packs that were uploaded.
+	defer r.discardOpenPackers()
+
 	err := r.treePM.Flush(ctx)
 	if err != nil {
+		r.shutdownUploader()
 		return err
 	}
 	err = r.dataPM.Flush(ctx)
 	if err != nil {
+		r.shutdownUploader()
 		return err
 	}
 	r.uploader.TriggerShutdown()
-	err = r.packerWg.Wait()
+	waitErr := r.packerWg.Wait()
+	r.uploader.DiscardPending()
 
 	r.treePM = nil
 	r.dataPM = nil
 	r.uploader = nil
 	r.packerWg = nil
 
-	return err
+	return waitErr
+}
+
+// shutdownUploader stops the uploader workers and releases the temporary files
+// of packs that were accepted but not fully uploaded. It is used when flushing
+// fails before the uploader is shut down normally.
+func (r *Repository) shutdownUploader() {
+	if r.uploader == nil || r.packerWg == nil {
+		return
+	}
+	r.uploader.TriggerShutdown()
+	_ = r.packerWg.Wait()
+	r.uploader.DiscardPending()
+}
+
+// discardOpenPackers closes the temporary files of all packs still held by the
+// packer managers. It must only be called after the uploader has stopped, as
+// otherwise it could close a temp file that an upload is still reading.
+func (r *Repository) discardOpenPackers() {
+	if r.treePM != nil {
+		r.treePM.discard()
+	}
+	if r.dataPM != nil {
+		r.dataPM.discard()
+	}
 }
 
 func (r *Repository) Connections() uint {
