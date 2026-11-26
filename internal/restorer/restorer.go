@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/restic/restic/internal/data"
@@ -18,12 +19,30 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// RestoreError records a single item that failed to restore together with the
+// causing error.
+type RestoreError struct {
+	Location string
+	Path     string
+	Err      error
+}
+
+func (e RestoreError) Error() string {
+	return fmt.Sprintf("restore %q: %v", e.Location, e.Err)
+}
+
+func (e RestoreError) Unwrap() error {
+	return e.Err
+}
+
 // Restorer is used to restore a snapshot to a directory.
 type Restorer struct {
 	repo restic.Repository
 	sn   *data.Snapshot
 	opts Options
 
+	// target is the destination directory of the active RestoreTo run.
+	target   string
 	fileList map[string]bool
 
 	Error func(location string, err error) error
@@ -34,6 +53,9 @@ type Restorer struct {
 	SelectFilter func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool)
 
 	XattrSelectFilter func(xattrName string) (xattrSelectedForRestore bool)
+
+	failuresMu sync.Mutex
+	failures   []RestoreError
 }
 
 var restorerAbortOnAllErrors = func(_ string, err error) error { return err }
@@ -45,32 +67,40 @@ type Options struct {
 	Overwrite       OverwriteBehavior
 	Delete          bool
 	OwnershipByName bool
+	// WorkerCount limits the number of concurrently restored files/packs. If
+	// zero, the number of repository connections is used.
+	WorkerCount int
+	// CleanupOnCancel removes files created by this restore when the context
+	// is canceled. Pre-existing files that were only overwritten are kept.
+	CleanupOnCancel bool
 }
 
 type OverwriteBehavior int
 
-// Constants for different overwrite behavior
+// Constants for different overwrite behavior. OverwriteNever is the zero
+// value so that a restorer created without explicit options never clobbers
+// existing files by default.
 const (
-	OverwriteAlways OverwriteBehavior = iota
+	OverwriteNever OverwriteBehavior = iota
+	OverwriteAlways
 	// OverwriteIfChanged is like OverwriteAlways except that it skips restoring the content
 	// of files with matching size&mtime. Metadata is always restored.
 	OverwriteIfChanged
 	OverwriteIfNewer
-	OverwriteNever
 	OverwriteInvalid
 )
 
 // Set implements the method needed for pflag command flag parsing.
 func (c *OverwriteBehavior) Set(s string) error {
 	switch s {
+	case "never":
+		*c = OverwriteNever
 	case "always":
 		*c = OverwriteAlways
 	case "if-changed":
 		*c = OverwriteIfChanged
 	case "if-newer":
 		*c = OverwriteIfNewer
-	case "never":
-		*c = OverwriteNever
 	default:
 		*c = OverwriteInvalid
 		return fmt.Errorf("invalid overwrite behavior %q, must be one of (always|if-changed|if-newer|never)", s)
@@ -81,14 +111,14 @@ func (c *OverwriteBehavior) Set(s string) error {
 
 func (c *OverwriteBehavior) String() string {
 	switch *c {
+	case OverwriteNever:
+		return "never"
 	case OverwriteAlways:
 		return "always"
 	case OverwriteIfChanged:
 		return "if-changed"
 	case OverwriteIfNewer:
 		return "if-newer"
-	case OverwriteNever:
-		return "never"
 	default:
 		return "invalid"
 	}
@@ -114,6 +144,18 @@ func NewRestorer(repo restic.Repository, sn *data.Snapshot, opts Options) *Resto
 	return r
 }
 
+// workerCount returns the effective number of concurrent restore workers.
+func (res *Restorer) workerCount() int {
+	if res.opts.WorkerCount > 0 {
+		return res.opts.WorkerCount
+	}
+	count := int(res.repo.Connections())
+	if count < 1 {
+		return 1
+	}
+	return count
+}
+
 type treeVisitor struct {
 	enterDir  func(node *data.Node, target, location string) error
 	visitNode func(node *data.Node, target, location string) error
@@ -128,13 +170,47 @@ func (res *Restorer) sanitizeError(location string, err error) error {
 		// Context errors are permanent.
 		return err
 	default:
-		return res.Error(location, err)
+		replaced := res.Error(location, err)
+		// record every item failure for the final summary, whether or not
+		// the callback decided to continue
+		res.recordFailure(location, err)
+		return replaced
 	}
+}
+
+// recordFailure stores err for the final failure summary. It is safe for use
+// from concurrent workers.
+func (res *Restorer) recordFailure(location string, err error) {
+	res.failuresMu.Lock()
+	res.failures = append(res.failures, RestoreError{
+		Location: location,
+		Path:     filepath.Join(res.dst(), location),
+		Err:      err,
+	})
+	res.failuresMu.Unlock()
+}
+
+// dst returns the restore target directory.
+func (res *Restorer) dst() string {
+	return res.target
+}
+
+// Failures returns the errors collected for items whose restore failed while
+// the configured Error callback decided to continue. A canceled context is not
+// part of the list.
+func (res *Restorer) Failures() []RestoreError {
+	res.failuresMu.Lock()
+	defer res.failuresMu.Unlock()
+	return slices.Clone(res.failures)
 }
 
 // traverseTree traverses a tree from the repo and calls treeVisitor.
 // target is the path in the file system, location within the snapshot.
 func (res *Restorer) traverseTree(ctx context.Context, target string, treeID restic.ID, visitor treeVisitor) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	location := string(filepath.Separator)
 
 	if visitor.enterDir != nil {
@@ -386,11 +462,23 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) 
 	}
 
 	idx := data.NewHardlinkIndex[string]()
+	res.target = dst
+	res.failuresMu.Lock()
+	res.failures = nil
+	res.failuresMu.Unlock()
 	filerestorer := newFileRestorer(dst, res.repo.LoadBlobsFromPack, res.repo.LookupBlob,
-		res.repo.Connections(), res.opts.Sparse, res.opts.Delete, res.repo.StartWarmup, res.opts.Progress,
+		res.workerCount(), res.opts.Sparse, res.opts.Delete, res.repo.StartWarmup, res.opts.Progress,
 		res.repo.ChunkerFactory().ZeroChunk())
-	filerestorer.Error = res.Error
+	filerestorer.Error = func(location string, err error) error {
+		replaced := res.Error(location, err)
+		// record every item failure for the final summary
+		res.recordFailure(location, err)
+		return replaced
+	}
 	filerestorer.Info = res.Info
+	if res.opts.CleanupOnCancel {
+		filerestorer.cleanupOnCancel = true
+	}
 
 	debug.Log("first pass for %q", dst)
 
@@ -482,11 +570,17 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error) 
 				return err
 			}
 
-			if _, ok := res.hasRestoredFile(location); ok {
-				return res.restoreNodeMetadataTo(node, target, location)
+			metadataOnly, ok := res.hasRestoredFile(location)
+			if !ok {
+				// don't touch skipped files
+				return nil
 			}
-			// don't touch skipped files
-			return nil
+			if metadataOnly && res.opts.Overwrite == OverwriteNever {
+				// the file pre-existed and was skipped; leave its metadata
+				// untouched as well
+				return nil
+			}
+			return res.restoreNodeMetadataTo(node, target, location)
 		},
 		leaveDir: func(node *data.Node, target, location string, expectedFilenames []string) error {
 			if res.opts.Delete {
@@ -605,6 +699,13 @@ func (res *Restorer) withOverwriteCheck(ctx context.Context, node *data.Node, ta
 		matches, buf, _ = res.verifyFile(ctx, target, node, false, res.opts.Overwrite == OverwriteIfChanged, buf)
 		// skip files that are already correct completely
 		updateMetadataOnly = !matches.NeedsRestore()
+		if updateMetadataOnly && res.opts.Sparse {
+			// The content matches, but a sparse restore still has to rewrite
+			// the file so that zero regions can be punched out of an existing,
+			// fully allocated file. The file restorer skips nothing in this
+			// case (see fileInfo.rewriteAll).
+			updateMetadataOnly = false
+		}
 	}
 
 	return buf, cb(updateMetadataOnly, matches)
@@ -628,7 +729,7 @@ func shouldOverwrite(overwrite OverwriteBehavior, node *data.Node, destination s
 		// return if node is newer
 		return node.ModTime.After(fi.ModTime()), nil
 	case OverwriteNever:
-		// file exists
+		// file exists, leave it untouched
 		return false, nil
 	}
 	panic("unknown overwrite behavior")

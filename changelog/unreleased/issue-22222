@@ -1,0 +1,20 @@
+Enhancement: Preserve sparse regions and add restore concurrency and cleanup options
+
+Sparse restores (`--sparse`) now punch holes for every run of zero bytes,
+including zeros in the middle or at the end of a blob. Restoring a sparse
+snapshot over an existing, fully allocated file now deallocates the zero
+regions instead of leaving stale data behind or filling the target disk. On
+filesystems without hole-punching support, zeros are written explicitly so the
+restored content stays correct.
+
+`restore` also gains:
+
+* `--file-workers` to limit the number of files restored concurrently. Bandwidth
+  can be limited independently with the global `--limit-download` option.
+* `--cleanup-on-cancel` (enabled by default), which removes files created by an
+  interrupted restore while keeping files that pre-existed at the target.
+* a final summary listing every item that failed to restore together with its
+  error. Individual item failures no longer abort the whole restore when the
+  error callback continues.
+
+https://github.com/restic/restic/issues/22221

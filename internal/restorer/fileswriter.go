@@ -154,6 +154,8 @@ func createFile(path string, createSize int64, sparse bool, allowRecursiveDelete
 
 func ensureSize(f *os.File, fi os.FileInfo, createSize int64, sparse bool) (*os.File, error) {
 	if sparse {
+		// Sparse files must never be preallocated: preallocating commits the
+		// whole range as data blocks and defeats hole punching later on.
 		err := truncateSparse(f, createSize)
 		if err != nil {
 			_ = f.Close()

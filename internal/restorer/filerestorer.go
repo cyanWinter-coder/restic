@@ -3,6 +3,7 @@ package restorer
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/feature"
+	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/restic"
 )
 
@@ -23,6 +25,9 @@ type fileInfo struct {
 	lock       sync.Mutex
 	inProgress bool
 	sparse     bool
+	// rewriteAll forces every blob of an existing file to be written again
+	// so that zero regions can be punched out during a sparse restore.
+	rewriteAll bool
 	size       int64
 	location   string // file on local filesystem relative to restorer basedir
 	blobs      any    // blobs of the file
@@ -57,17 +62,27 @@ type fileRestorer struct {
 	progress    ProgressReporter
 
 	allowRecursiveDelete bool
+	// cleanupOnCancel removes files created by this restore when the context
+	// is canceled.
+	cleanupOnCancel bool
 
 	dst   string
 	files []*fileInfo
 	Error func(string, error) error
 	Info  func(string)
+
+	// createdFiles tracks files that did not exist before this restore, so
+	// that they can be removed on cancellation. Paths are absolute target
+	// paths.
+	createdMu    sync.Mutex
+	createdFiles map[string]struct{}
+	preexisting  map[string]struct{}
 }
 
 func newFileRestorer(dst string,
 	blobsLoader blobsLoaderFn,
 	idx func(restic.BlobHandle) []restic.PackBlob,
-	connections uint,
+	workerCount int,
 	sparse bool,
 	allowRecursiveDelete bool,
 	startWarmup startWarmupFn,
@@ -75,7 +90,9 @@ func newFileRestorer(dst string,
 	zeroChunk restic.ID) *fileRestorer {
 
 	// as packs are streamed the concurrency is limited by IO
-	workerCount := int(connections)
+	if workerCount < 1 {
+		workerCount = 1
+	}
 
 	return &fileRestorer{
 		idx:                  idx,
@@ -90,6 +107,8 @@ func newFileRestorer(dst string,
 		dst:                  dst,
 		Error:                restorerAbortOnAllErrors,
 		Info:                 func(_ string) {},
+		createdFiles:         make(map[string]struct{}),
+		preexisting:          make(map[string]struct{}),
 	}
 }
 
@@ -141,19 +160,26 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 			packsMap = make(map[restic.ID][]fileBlobInfo)
 			file.blobs = packsMap
 		}
+		rewriteAll := file.state != nil && r.sparse
+		file.rewriteAll = rewriteAll
+		if rewriteAll {
+			file.sparse = true
+		}
 		restoredBlobs := false
 		err := r.forEachBlob(fileBlobs, func(blob restic.PackBlob, idx int, fileOffset int64) {
 			packID := blob.PackID()
-			if !file.state.HasMatchingBlob(idx) {
-				if largeFile {
-					packsMap[packID] = append(packsMap[packID], fileBlobInfo{id: blob.Handle().ID, offset: fileOffset})
-				}
-				restoredBlobs = true
-			} else {
+			if blob.Handle().ID.Equal(r.zeroChunk) {
+				file.sparse = r.sparse
+			}
+			if !file.rewriteAll && file.state.HasMatchingBlob(idx) {
 				r.reportBlobProgress(file, uint64(blob.PlaintextLength()))
 				// completely ignore blob
 				return
 			}
+			if largeFile {
+				packsMap[packID] = append(packsMap[packID], fileBlobInfo{id: blob.Handle().ID, offset: fileOffset})
+			}
+			restoredBlobs = true
 			pack, ok := packs[packID]
 			if !ok {
 				pack = &packInfo{
@@ -164,9 +190,6 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 				packOrder = append(packOrder, packID)
 			}
 			pack.files[file] = struct{}{}
-			if blob.Handle().ID.Equal(r.zeroChunk) {
-				file.sparse = r.sparse
-			}
 		})
 		if err != nil {
 			// repository index is messed up, can't do anything
@@ -178,16 +201,10 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 			// in addition, a short chunk will never match r.zeroChunk which would prevent sparseness for short files
 			file.sparse = r.sparse
 		}
-		if file.state != nil {
-			// The restorer currently cannot punch new holes into an existing files.
-			// Thus sections that contained data but should be sparse after restoring
-			// the snapshot would still contain the old data resulting in a corrupt restore.
-			file.sparse = false
-		}
 
 		// empty file or one with already up-to-date content. Make sure that the file size is correct
 		if !restoredBlobs {
-			err := r.truncateFileToSize(file.location, file.size)
+			err := r.truncateFileToSize(file.location, file.size, file.sparse)
 			if errFile := r.sanitizeError(file, err); errFile != nil {
 				return errFile
 			}
@@ -248,15 +265,67 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 		return nil
 	})
 
-	return wg.Wait()
+	err := wg.Wait()
+	if err != nil && ctx.Err() != nil {
+		// the restore was interrupted, remove partial files created by us
+		r.cleanupCreatedFiles()
+	}
+	return err
 }
 
-func (r *fileRestorer) truncateFileToSize(location string, size int64) error {
-	f, err := createFile(r.targetPath(location), size, false, r.allowRecursiveDelete)
+func (r *fileRestorer) truncateFileToSize(location string, size int64, sparse bool) error {
+	path := r.targetPath(location)
+	if r.cleanupOnCancel {
+		r.trackFileCreation(path)
+	}
+	f, err := createFile(path, size, sparse, r.allowRecursiveDelete)
 	if err != nil {
 		return err
 	}
 	return f.Close()
+}
+
+// trackFileCreation records whether path existed before this restore. Only
+// genuinely new files are eligible for cancellation cleanup.
+func (r *fileRestorer) trackFileCreation(path string) {
+	r.createdMu.Lock()
+	defer r.createdMu.Unlock()
+	if _, ok := r.preexisting[path]; ok {
+		return
+	}
+	if _, ok := r.createdFiles[path]; ok {
+		return
+	}
+	if _, err := fs.Lstat(path); err == nil {
+		r.preexisting[path] = struct{}{}
+		return
+	}
+	r.createdFiles[path] = struct{}{}
+}
+
+// cleanupCreatedFiles removes files that this restore created and that were
+// not present in the target directory beforehand. Best-effort: errors are only
+// logged through the configured Error callback.
+func (r *fileRestorer) cleanupCreatedFiles() {
+	if !r.cleanupOnCancel {
+		return
+	}
+	// close cached file handles first so that removals succeed on Windows
+	r.filesWriter.flush()
+
+	r.createdMu.Lock()
+	paths := make([]string, 0, len(r.createdFiles))
+	for path := range r.createdFiles {
+		paths = append(paths, path)
+	}
+	r.createdFiles = make(map[string]struct{})
+	r.createdMu.Unlock()
+
+	for _, path := range paths {
+		if err := fs.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = r.Error(path, fmt.Errorf("cleanup after cancellation failed: %w", err))
+		}
+	}
 }
 
 type blobToFileOffsetsMapping map[restic.ID]struct {
@@ -279,7 +348,7 @@ func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) error {
 		}
 		if fileBlobs, ok := file.blobs.(restic.IDs); ok {
 			err := r.forEachBlob(fileBlobs, func(blob restic.PackBlob, idx int, fileOffset int64) {
-				if blob.PackID().Equal(pack.id) && !file.state.HasMatchingBlob(idx) {
+				if blob.PackID().Equal(pack.id) && (file.rewriteAll || !file.state.HasMatchingBlob(idx)) {
 					addBlob(blob.Handle(), fileOffset)
 				}
 			})
@@ -381,6 +450,9 @@ func (r *fileRestorer) downloadBlobs(ctx context.Context, packID restic.ID,
 							defer file.lock.Unlock()
 							file.inProgress = true
 							createSize = file.size
+							if r.cleanupOnCancel {
+								r.trackFileCreation(r.targetPath(file.location))
+							}
 						}
 						writeErr := r.filesWriter.writeToFile(r.targetPath(file.location), blobData, offset, createSize, file.sparse)
 						r.reportBlobProgress(file, uint64(len(blobData)))

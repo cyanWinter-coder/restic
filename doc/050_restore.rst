@@ -93,11 +93,15 @@ enable the creation of sparse files if supported by the filesystem. Then restic
 will restore long runs of zero bytes as holes in the corresponding files.
 Reading from a hole returns the original zero bytes, but it does not consume
 disk space. Note that restic does not keep track of which files were originally
-sparse or at what locations sparse holes were. When restoring, restic will create
-a sparse hole (by seeking forward instead of writing data) for any range of zeros
-at the start of a blob. This range can span the entire blob. Because large files
-result in blobs much larger than file system blocks, restoring a large sparse file
-with many holes may make it significantly larger than the original sparse file.
+sparse or at what locations sparse holes were. When restoring, restic punches a
+sparse hole for any run of zeros within a blob, including zeros at the start,
+middle or end of a blob. This also applies when restoring over an existing
+file: zero regions that currently hold data are deallocated instead of leaving
+the old content behind. On filesystems that do not support hole punching, the
+zeros are written explicitly so the restored content is always correct, even
+though the file may end up fully allocated. Because large files result in
+blobs much larger than file system blocks, restoring a large sparse file with
+many holes may make it significantly larger than the original sparse file.
 
 Restoring extended file attributes
 ----------------------------------
@@ -123,11 +127,11 @@ Restoring in-place
     operation is interrupted. To ensure you can revert back to the previous state, create
     a current ``backup`` before restoring a different snapshot.
 
-By default, the ``restore`` command overwrites already existing files at the target
-directory. This behavior can be configured via the ``--overwrite`` option. The following
-values are supported:
+By default, the ``restore`` command does not overwrite already existing files at
+the target directory. This behavior can be configured via the ``--overwrite``
+option. The following values are supported:
 
-* ``--overwrite always`` (default): always overwrites already existing files. ``restore``
+* ``--overwrite always``: always overwrites already existing files. ``restore``
   will verify the existing file content and only restore mismatching parts to minimize
   downloads. Updates the metadata of all files.
 * ``--overwrite if-changed``: like the previous case, but speeds up the file content check
@@ -135,7 +139,22 @@ values are supported:
   In case of a mismatch, the full file content is verified. Updates the metadata of all files.
 * ``--overwrite if-newer``: only overwrite existing files if the file in the snapshot has a
   newer modification time (mtime).
-* ``--overwrite never``: never overwrite existing files.
+* ``--overwrite never`` (default): never overwrite existing files, including their metadata.
+  Files that do not exist at the target are still restored.
+
+Files that fail to restore because of a non-fatal error do not abort the whole
+operation. The command continues with the remaining items and prints a summary
+of the failed items together with the causing errors at the end.
+
+Use ``--file-workers`` to cap the number of files restored concurrently. By
+default the number of backend connections (``--option connections=``) is used.
+Bandwidth can additionally be limited with the global ``--limit-download``
+option.
+
+When a restore is interrupted (for example by pressing Ctrl-C), the files
+created during that run are removed by default so that no half-written files
+remain; files that already existed before the restore are kept. Pass
+``--cleanup-on-cancel=false`` to keep the partially written files instead.
 
 Deleting files not in snapshot
 ------------------------------

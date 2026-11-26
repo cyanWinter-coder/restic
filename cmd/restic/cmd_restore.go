@@ -74,6 +74,8 @@ type RestoreOptions struct {
 	ExcludeXattrPattern []string
 	IncludeXattrPattern []string
 	OwnershipByName     bool
+	FileWorkers         int
+	CleanupOnCancel     bool
 }
 
 func (opts *RestoreOptions) AddFlags(f *pflag.FlagSet) {
@@ -89,8 +91,10 @@ func (opts *RestoreOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.DryRun, "dry-run", false, "do not write any data, just show what would be done")
 	f.BoolVar(&opts.Sparse, "sparse", false, "restore files as sparse")
 	f.BoolVar(&opts.Verify, "verify", false, "verify restored files content")
-	f.Var(&opts.Overwrite, "overwrite", "overwrite behavior, one of (always|if-changed|if-newer|never)")
+	f.Var(&opts.Overwrite, "overwrite", "overwrite behavior, one of (always|if-changed|if-newer|never) (default: never)")
 	f.BoolVar(&opts.Delete, "delete", false, "delete files from target directory if they do not exist in snapshot. Use '--dry-run -vv' to check what would be deleted")
+	f.IntVar(&opts.FileWorkers, "file-workers", 0, "maximum number of files to restore concurrently (default: backend connections)")
+	f.BoolVar(&opts.CleanupOnCancel, "cleanup-on-cancel", true, "remove files created by this restore when it is interrupted")
 	if runtime.GOOS != "windows" {
 		f.BoolVar(&opts.OwnershipByName, "ownership-by-name", false, "restore file ownership by user name and group name (except POSIX ACLs)")
 	}
@@ -142,6 +146,10 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts global.Options,
 		return errors.Fatal("'--target / --delete' must be combined with an include or exclude filter")
 	}
 
+	if opts.FileWorkers < 0 {
+		return errors.Fatal("--file-workers must be greater than or equal to zero")
+	}
+
 	snapshotIDString := args[0]
 
 	debug.Log("restore %v to %v", snapshotIDString, opts.Target)
@@ -175,6 +183,8 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts global.Options,
 		Overwrite:       opts.Overwrite,
 		Delete:          opts.Delete,
 		OwnershipByName: opts.OwnershipByName,
+		WorkerCount:     opts.FileWorkers,
+		CleanupOnCancel: opts.CleanupOnCancel,
 	})
 
 	totalErrors := 0
@@ -248,10 +258,19 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts global.Options,
 
 	countRestoredFiles, err := res.RestoreTo(ctx, opts.Target)
 	if err != nil {
+		// a canceled restore already cleaned up its partial files
 		return err
 	}
 
 	progress.Finish()
+
+	if failures := res.Failures(); len(failures) > 0 {
+		printer.P("\nSummary: failed to restore %d item(s):\n", len(failures))
+		for _, failure := range failures {
+			printer.P("  %s: %v\n", failure.Location, failure.Err)
+		}
+		return errors.Fatalf("There were %d errors", len(failures))
+	}
 
 	if totalErrors > 0 {
 		return errors.Fatalf("There were %d errors", totalErrors)

@@ -1,0 +1,12 @@
+Change: Do not overwrite existing files by default during restore
+
+The `restore` command now defaults to `--overwrite never` instead of
+`--overwrite always`. Files that already exist at the target location are left
+completely untouched, including their content, permissions and timestamps;
+files that do not exist are still restored. The previous behavior is available
+by explicitly passing `--overwrite always`.
+
+This makes a restore into a non-empty directory safe by default, so an
+accidental restore can no longer clobber existing data.
+
+https://github.com/restic/restic/issues/22221
